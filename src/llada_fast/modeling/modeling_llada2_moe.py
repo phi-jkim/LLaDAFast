@@ -49,6 +49,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from .configuration_llada2_moe import LLaDA2MoeConfig
+from .linear_attention import OrderInvariantKernelLinearAttention
 from transformers.generation.utils import GenerationMixin
 
 
@@ -457,6 +458,11 @@ class LLaDA2MoeAttention(nn.Module):
         )
         self.sliding_window = getattr(config, "sliding_window", None)
 
+        if config.use_linear_attention:
+            self.linear_attention = OrderInvariantKernelLinearAttention(
+                config, block_size=config.block_size
+            )
+
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return (
             tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
@@ -520,17 +526,23 @@ class LLaDA2MoeAttention(nn.Module):
                 self.config._attn_implementation
             ]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+        if self.config.use_linear_attention:
+            attn_output = self.linear_attention(
+                query_states, key_states, value_states, attention_mask
+            )
+            attn_weights = None
+        else:
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.dense(attn_output)

@@ -44,6 +44,8 @@ class LLaDA2MoeConfig(PretrainedConfig):
         head_dim=None,
         output_router_logits=False,
         partial_rotary_factor=0.5,
+        use_linear_attention=False,
+        block_size=512,
         **kwargs,
     ):
         self.num_hidden_layers = num_hidden_layers
@@ -82,6 +84,8 @@ class LLaDA2MoeConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.routed_scaling_factor = routed_scaling_factor
         self.partial_rotary_factor = partial_rotary_factor
+        self.use_linear_attention = use_linear_attention
+        self.block_size = block_size
 
         super().__init__(
             pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
