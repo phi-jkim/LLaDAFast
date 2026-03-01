@@ -1,0 +1,24 @@
+name: llada_fast
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
+  - tqdm
+  - numpy
+  - pyyaml
+  - git-lfs
+  - pip
+  - pip:
+      - transformers>=4.40.0
+      - accelerate>=0.29.0
+      - peft>=0.10.0
+      - datasets>=2.18.0
+      - sentencepiece
+      - safetensors

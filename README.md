@@ -27,7 +27,8 @@ LLaDAFast/
 
 ### Installation
 ```bash
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate llada_fast
 ```
 
 ### Distillation (Step 1)
