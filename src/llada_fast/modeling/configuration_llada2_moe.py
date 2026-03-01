@@ -32,7 +32,7 @@ class LLaDA2MoeConfig(PretrainedConfig):
         sliding_window=4096,
         max_window_layers=28,
         rope_scaling=None,
-        pad_token_id=126081,
+        pad_token_id=156892,
         num_experts=16,
         num_shared_experts=0,
         num_experts_per_tok=2,
@@ -45,7 +45,7 @@ class LLaDA2MoeConfig(PretrainedConfig):
         output_router_logits=False,
         partial_rotary_factor=0.5,
         use_linear_attention=False,
-        block_size=512,
+        block_size=32,
         **kwargs,
     ):
         self.num_hidden_layers = num_hidden_layers

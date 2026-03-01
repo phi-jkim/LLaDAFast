@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: llada-fast
+Version: 0.1.0
+Summary: Fast Linear Attention for LLaDA
+Requires-Dist: torch
+Requires-Dist: transformers
+Requires-Dist: accelerate
+Requires-Dist: peft
+Requires-Dist: datasets
+Requires-Dist: safetensors
+Requires-Dist: tqdm
+Requires-Dist: numpy
