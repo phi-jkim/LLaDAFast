@@ -32,8 +32,15 @@ conda activate llada_fast
 ```
 
 ### Distillation (Step 1)
+**Requirements**: This script requires **2 GPUs** (80GB+ each). The Frozen Teacher is loaded on `cuda:0` and the Student on `cuda:1`.
+
+Run the progressive layer-swapping curriculum:
 ```bash
-python scripts/distill.py --config configs/distill_step1.yaml
+python src/llada_fast/training/distill.py \
+    --steps 15000 \
+    --lr 5e-5 \
+    --progressive_interval 300 \
+    --force_decay_length 1500
 ```
 
 ### LoRA Recovery (Step 2)
