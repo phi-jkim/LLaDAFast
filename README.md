@@ -6,7 +6,6 @@ LLaDAFast is an optimized implementation of [LLaDA 2.1-mini](https://huggingface
 - **Linear Efficiency**: Replaces standard softmax attention with an order-invariant kernel linear attention.
 - **Frozen-Teacher Distillation**: Learns from the original LLaDA 2.1-mini using a truly frozen teacher strategy on FineWeb-Edu.
 - **LoRA Recovery**: Restores performance via LoRA post-training on UltraChat with the LLaDA denoising/diffusion objective.
-- **Scalable Context**: Designed to support up to 32K context efficiently.
 
 ## Repository Structure
 ```text
