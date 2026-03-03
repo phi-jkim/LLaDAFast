@@ -1,0 +1,26 @@
+Loading model...
+Loading checkpoint shards:   0%|          | 0/8 [00:00<?, ?it/s]Loading checkpoint shards:  12%|█▎        | 1/8 [00:01<00:08,  1.20s/it]Loading checkpoint shards:  25%|██▌       | 2/8 [00:02<00:06,  1.13s/it]Loading checkpoint shards:  38%|███▊      | 3/8 [00:03<00:06,  1.21s/it]Loading checkpoint shards:  50%|█████     | 4/8 [00:04<00:04,  1.23s/it]Loading checkpoint shards:  62%|██████▎   | 5/8 [00:05<00:03,  1.20s/it]Loading checkpoint shards:  75%|███████▌  | 6/8 [00:07<00:02,  1.19s/it]Loading checkpoint shards:  88%|████████▊ | 7/8 [00:08<00:01,  1.20s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:09<00:00,  1.17s/it]Loading checkpoint shards: 100%|██████████| 8/8 [00:09<00:00,  1.19s/it]
+ERROR: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx
+Traceback (most recent call last):
+  File "/home/jinhakim/LLaDAFast/debug_teacher_attn.py", line 14, in <module>
+    teacher = LLaDA2MoeModelLM.from_pretrained("inclusionAI/LLaDA2.1-mini", torch_dtype=torch.bfloat16, trust_remote_code=True).to(device).eval()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/transformers/modeling_utils.py", line 4462, in to
+    return super().to(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1340, in to
+    return self._apply(convert)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 900, in _apply
+    module._apply(fn)
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 900, in _apply
+    module._apply(fn)
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 927, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1326, in convert
+    return t.to(
+           ^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/cuda/__init__.py", line 319, in _lazy_init
+    torch._C._cuda_init()
+RuntimeError: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx

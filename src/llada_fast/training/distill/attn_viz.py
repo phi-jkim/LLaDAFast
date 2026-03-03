@@ -1,88 +1,107 @@
 """
 Attention matrix visualization for LLaDAFast distillation.
 
-Saves side-by-side teacher vs. student attention heatmaps every N steps.
+Saves two PNGs per visualization step:
+  teacher_step_XXXXXXX.png  —  all N layers, softmax attention (head-averaged)
+  student_step_XXXXXXX.png  —  all is_linear_active layers, linear kernel matrix
+                                computed on a "clean past, noisy present" input
 
-Teacher: softmax attention weights (B, H, L, L) captured via output_attentions=True.
-Student: for linear attention, the "effective" attention kernel matrix is computed as
-         the normalized kernel scores phi_q_i^T phi_k_j / (phi_q_i^T Z_i), where Z_i
-         is the cumulative key sum up to (but not including) position i (causal prefix).
+Teacher: softmax attn_weights (B, H, L, L) captured via forward hook.
+Student: effective linear-attention kernel A[i,j] = phi_q_i·phi_k_j / (phi_q_i·Z_i)
+         where Z_i is the causal prefix sum of phi_k up to (but not including) i.
 """
 
 import os
-from typing import List, Optional
+import random
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 import matplotlib
-matplotlib.use("Agg")   # non-interactive backend (safe for cluster training)
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
 
-# ── Teacher: capture softmax attention weights ────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _get_teacher_attn_weights(
+def _mask_to_additive(mask_0_1: torch.Tensor) -> torch.Tensor:
+    """Convert 0/1 block-causal mask → additive (-1e9 / 0.0) for softmax."""
+    return (1.0 - mask_0_1.float()) * -1e9
+
+
+def _capture_teacher_attn(
     teacher,
-    input_ids: torch.Tensor,           # (1, L)
-    attention_mask_4d: torch.Tensor,   # (1, 1, L, L)
-    key_padding_mask: torch.Tensor,    # (1, L)
+    input_ids: torch.Tensor,
+    attn_mask_0_1: torch.Tensor,
+    key_padding_mask: torch.Tensor,
     layer_ids: List[int],
     device: torch.device,
-) -> dict:
+) -> Dict[int, torch.Tensor]:
     """
-    Run a teacher forward with output_attentions=True.
-    Returns {layer_id: attn_weights (H, L, L)} (first batch element, cpu).
+    Returns {li: (H, L, L) float32 cpu tensor} for every requested layer.
+    Uses 'output_attentions=True' to trigger weight computation in the model.
+    Note: Pass the RAW 0/1 mask; LLaDA2MoeModel.forward converts it to additive.
     """
-    store = {}
+    store: Dict[int, torch.Tensor] = {}
     handles = []
 
     for li in layer_ids:
         def _hook(module, inp, out, _li=li):
-            # out = (attn_output, attn_weights, past_kv)
-            if isinstance(out, (tuple, list)) and len(out) > 1 and out[1] is not None:
-                store[_li] = out[1][0].detach().cpu()   # (H, L, L)
+            try:
+                # out is (attn_output, attn_weights, past_key_value)
+                w = out[1] if (isinstance(out, (tuple, list)) and len(out) > 1) else None
+                if w is not None and isinstance(w, torch.Tensor) and w.dim() == 4:
+                    w_cpu = w[0].detach().float().cpu()
+                    # Softmax weights should be non-negative.
+                    if w_cpu.min() >= -0.1: 
+                        store[_li] = w_cpu
+            except Exception:
+                pass
         h = teacher.model.layers[li].attention.register_forward_hook(_hook)
         handles.append(h)
 
-    with torch.no_grad():
-        teacher.model(
-            input_ids.to(device),
-            attention_mask=attention_mask_4d.to(device),
-            key_padding_mask=key_padding_mask.to(device).bool(),
-            output_attentions=True,
-        )
+    try:
+        with torch.no_grad():
+            teacher.model(
+                input_ids.to(device),
+                attention_mask=attn_mask_0_1.to(device),
+                key_padding_mask=key_padding_mask.to(device).bool(),
+                output_attentions=True,
+            )
+    finally:
+        for h in handles:
+            h.remove()
 
-    for h in handles:
-        h.remove()
-
+    missing = [li for li in layer_ids if li not in store]
+    if missing:
+        print(f"[VIZ] Warning: teacher attn N/A for layers {missing}. "
+              f"Check model configuration or output_attentions support.")
     return store
 
 
-# ── Student: compute effective linear-attention kernel matrix ─────────────────
-
-def _compute_student_kernel_matrix(
+def _compute_student_kernel(
     student,
-    input_ids: torch.Tensor,
-    attention_mask_4d: torch.Tensor,
-    key_padding_mask: torch.Tensor,
+    input_ids: torch.Tensor,           # (1, L)  noisy (clean-past/noisy-present)
+    attn_mask_4d: torch.Tensor,        # (1, 1, L, L)  0/1 block-causal
+    key_padding_mask: torch.Tensor,    # (1, L)
     layer_ids: List[int],
     device: torch.device,
-) -> dict:
+) -> Dict[int, torch.Tensor]:
     """
-    For each active linear attention layer, computes the L×L effective attention
-    kernel matrix:
-        A[i, j] = phi_q_i^T phi_k_j / (phi_q_i^T Z_i)
-    where Z_i = cumulative sum of phi_k_{0..i-1} (causal prefix, excluding self).
+    For every is_linear_active layer in layer_ids, computes the L×L effective
+    linear-attention kernel matrix:
+        A[i, j] = phi_q_i · phi_k_j / (phi_q_i · Z_i)   (causal, normalized)
 
-    Returns {layer_id: attn_matrix (H, L, L)} on cpu.
+    Returns {li: (H, L, L) float32 cpu tensor}.
     """
-    store = {}
+    store: Dict[int, torch.Tensor] = {}
     handles = []
 
     for li in layer_ids:
         attn_mod = student.model.layers[li].attention
-        if not (getattr(attn_mod, "is_linear_active", False) and hasattr(attn_mod, "linear_attention")):
+        if not hasattr(attn_mod, "linear_attention"):
             continue
         lin_attn = attn_mod.linear_attention
 
@@ -92,21 +111,17 @@ def _compute_student_kernel_matrix(
             q, k = args[0], args[1]
             with torch.no_grad():
                 B, H, L_in, D = q.shape
-                num_blocks = (L_in + module.block_size - 1) // module.block_size
-                padded_L   = num_blocks * module.block_size
+                S = module.block_size
+                num_blocks = (L_in + S - 1) // S
+                padded_L   = num_blocks * S
                 pad_len    = padded_L - L_in
-                S          = module.block_size
 
                 q_p = F.pad(q, (0, 0, 0, pad_len)) if pad_len > 0 else q
                 k_p = F.pad(k, (0, 0, 0, pad_len)) if pad_len > 0 else k
-
-                # Reshape to (B, H, N, S, D) as expected by _feature_map
                 q_b = q_p.view(B, H, num_blocks, S, D)
                 k_b = k_p.view(B, H, num_blocks, S, D)
 
-                # Feature maps — handle both module signatures:
-                #   OrderInvariantKernelLinearAttention._feature_map(x, compute_dtype)
-                #   BlockSoftmaxLinearHybrid._feature_map(x)
+                # Handle both _feature_map(x, dtype) and _feature_map(x)
                 try:
                     phi_q = module._feature_map(q_b, q.dtype)
                     phi_k = module._feature_map(k_b, k.dtype)
@@ -115,31 +130,28 @@ def _compute_student_kernel_matrix(
                     phi_k = module._feature_map(k_b)
 
                 Df = phi_q.shape[-1]
-                phi_q_flat = phi_q.reshape(B, H, padded_L, Df).float()
-                phi_k_flat = phi_k.reshape(B, H, padded_L, Df).float()
+                phi_q_f = phi_q.reshape(B, H, padded_L, Df).float()
+                phi_k_f = phi_k.reshape(B, H, padded_L, Df).float()
 
-                # ── Numerator: full (i, j) kernel scores ──────────────────────
-                # K_num[i, j] = phi_q_i · phi_k_j
-                K_num = torch.matmul(phi_q_flat, phi_k_flat.transpose(-1, -2))  # (B,H,L,L)
+                # Numerator: phi_q_i · phi_k_j  →  (B, H, L, L)
+                K_num = torch.matmul(phi_q_f, phi_k_f.transpose(-1, -2))
 
-                # ── Denominator: per query position (i,) ──────────────────────
-                # Z_causal[i] = sum_{k=0}^{i-1} phi_k_k  (prefix, excludes self)
-                Z_cum    = phi_k_flat.cumsum(dim=2)                  # (B, H, padded_L, Df)
-                Z_causal = torch.cat([
-                    torch.zeros(B, H, 1, Df, device=Z_cum.device),
-                    Z_cum[:, :, :-1, :]
-                ], dim=2)                                             # (B, H, padded_L, Df)
+                # Use the block-causal mask from the model.
+                mask = attn_mask_4d[0, 0, :padded_L, :padded_L].to(device=q.device).clone()
+                
+                # If in Hybrid mode, the linear part is purposefully blind to the current block
+                # (handled by softmax instead). Mask out the diagonal blocks to show this.
+                if lin_attn.__class__.__name__ == "BlockSoftmaxLinearHybrid":
+                    S = lin_attn.block_size
+                    b_idx_q = torch.arange(padded_L, device=q.device) // S
+                    b_idx_k = torch.arange(padded_L, device=q.device) // S
+                    mask *= (b_idx_k.unsqueeze(0) < b_idx_q.unsqueeze(1)).float()
+                
+                K_num = K_num.masked_fill(mask == 0, float("-inf"))
 
-                # denom_q[i] = phi_q_i · Z_causal_i  →  (B, H, padded_L, 1)
-                denom_q = (phi_q_flat * Z_causal).sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-                # ── Causal mask ────────────────────────────────────────────────
-                causal = torch.tril(torch.ones(padded_L, padded_L, device=q.device))
-                K_num  = K_num * causal
-
-                # ── Normalize and crop ─────────────────────────────────────────
-                A = (K_num / denom_q)[:, :, :L_in, :L_in]    # (B, H, L_in, L_in)
-                A = A / A.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                # Softmax over keys (makes it directly comparable to teacher softmax)
+                A = torch.softmax(K_num.float(), dim=-1)  # (B, H, L, L)
+                A = A[:, :, :L_in, :L_in]
 
                 store[_li] = A[0].detach().cpu()   # (H, L_in, L_in)
 
@@ -149,87 +161,194 @@ def _compute_student_kernel_matrix(
     with torch.no_grad():
         student.model(
             input_ids.to(device),
-            attention_mask=attention_mask_4d.to(device),
+            attention_mask=attn_mask_4d.to(device),
             key_padding_mask=key_padding_mask.to(device).bool(),
         )
-
     for h in handles:
         h.remove()
-
     return store
 
 
-# ── Plotting ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Public plotting API
+# ─────────────────────────────────────────────────────────────────────────────
 
-def plot_and_save_attention(
-    teacher_weights: dict,      # {layer_id: (H, L, L)}
-    student_weights: dict,      # {layer_id: (H, L, L)}
-    layer_ids: List[int],
+def _draw_heatmap(ax, mat, title: str, cmap: str = "viridis", vmin=0, vmax=None):
+    """Draw a single heatmap on ax with a colorbar."""
+    kw = dict(aspect="auto", cmap=cmap, vmin=vmin)
+    if vmax is not None:
+        kw["vmax"] = vmax
+    im = ax.imshow(mat, **kw)
+    plt.colorbar(im, ax=ax, fraction=0.03, pad=0.01)
+    ax.set_title(title, fontsize=7)
+    ax.set_xlabel("Key", fontsize=6)
+    ax.set_ylabel("Query", fontsize=6)
+    ax.tick_params(labelsize=5)
+
+
+def plot_teacher_all_layers(
+    teacher,
+    input_ids: torch.Tensor,
+    attn_mask_0_1: torch.Tensor,
+    key_padding_mask: torch.Tensor,
+    n_layers: int,
     step: int,
     out_dir: str,
-    max_len: int = 128,         # truncate to this many tokens for readability
+    max_len: int = 128,
+    layers_per_page: int = 4,
+    device: torch.device = torch.device("cuda:0"),
 ) -> None:
     """
-    Saves a PNG grid: rows = layers, cols = [teacher_avg, student_avg, diff].
+    Saves teacher_step_XXXXXXX_p{page}.png per page of `layers_per_page` rows.
     """
     os.makedirs(out_dir, exist_ok=True)
+    layer_ids = list(range(n_layers))
+    # Pass 0/1 mask directly; teacher.model will convert to additive.
+    weights = _capture_teacher_attn(teacher, input_ids, attn_mask_0_1,
+                                     key_padding_mask, layer_ids, device)
 
-    n_layers = len(layer_ids)
-    if n_layers == 0:
+    pages = [layer_ids[i:i+layers_per_page] for i in range(0, n_layers, layers_per_page)]
+    for page_idx, page_layers in enumerate(pages):
+        n = len(page_layers)
+        # Use 2 columns for two random heads Side-by-Side
+        fig, axes = plt.subplots(n, 2, figsize=(14, 3.5 * n))
+        if n == 1:
+            axes = axes.reshape(1, 2)
+            
+        for row, li in enumerate(page_layers):
+            w = weights.get(li)
+            if w is not None:
+                num_heads = w.shape[0]
+                # Pick two random unique heads
+                rng = random.Random(step + li)
+                h1, h2 = rng.sample(range(num_heads), 2) if num_heads > 1 else (0, 0)
+                
+                L = min(w.shape[-1], max_len)
+                for col, h_idx in enumerate([h1, h2]):
+                    ax = axes[row, col]
+                    mat = w[h_idx].float()[:L, :L].numpy()
+                    _draw_heatmap(ax, mat, f"Layer {li} (Head {h_idx})")
+            else:
+                for col in range(2):
+                    ax = axes[row, col]
+                    ax.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax.transAxes)
+                    ax.set_title(f"Layer {li}", fontsize=7)
+        layers_str = f"L{page_layers[0]}–{page_layers[-1]}"
+        fig.suptitle(f"Teacher Attention ({layers_str}) — Step {step}", fontsize=10)
+        plt.tight_layout()
+        fpath = os.path.join(out_dir, f"teacher_step_{step:07d}_p{page_idx:02d}.png")
+        fig.savefig(fpath, bbox_inches="tight", dpi=80)
+        plt.close(fig)
+        print(f"[VIZ] Teacher p{page_idx} → {fpath}")
+
+
+def plot_student_all_layers(
+    student,
+    noisy_input_ids: torch.Tensor,
+    attn_mask_0_1: torch.Tensor,
+    key_padding_mask: torch.Tensor,
+    n_layers: int,
+    step: int,
+    out_dir: str,
+    max_len: int = 128,
+    layers_per_page: int = 4,
+    device: torch.device = torch.device("cuda:1"),
+) -> None:
+    """
+    Saves student_step_XXXXXXX_p{page}.png per page of `layers_per_page` rows.
+    Linear attention stays active; kernel scores phi_q·phi_k are softmax'd
+    post-hoc so the display is a proper probability distribution comparable
+    to the teacher softmax plot.
+    Frozen (not-yet-active) layers show 'softmax frozen' placeholder.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    layer_ids = list(range(n_layers))
+    kernel = _compute_student_kernel(student, noisy_input_ids, attn_mask_0_1,
+                                      key_padding_mask, layer_ids, device)
+
+    pages = [layer_ids[i:i+layers_per_page] for i in range(0, n_layers, layers_per_page)]
+    for page_idx, page_layers in enumerate(pages):
+        n = len(page_layers)
+        # Use 2 columns for two random heads Side-by-Side
+        fig, axes = plt.subplots(n, 2, figsize=(14, 3.5 * n))
+        if n == 1:
+            axes = axes.reshape(1, 2)
+            
+        for row, li in enumerate(page_layers):
+            w = kernel.get(li)
+            is_active = getattr(student.model.layers[li].attention, "is_linear_active", False)
+            if w is not None:
+                num_heads = w.shape[0]
+                # Pick two random unique heads
+                rng = random.Random(step + li + 99) # different seed than teacher
+                h1, h2 = rng.sample(range(num_heads), 2) if num_heads > 1 else (0, 0)
+                
+                L = min(w.shape[-1], max_len)
+                tag = "[kernel softmax]" if is_active else "[kernel frozen]"
+                for col, h_idx in enumerate([h1, h2]):
+                    ax = axes[row, col]
+                    mat = w[h_idx].float()[:L, :L].numpy()
+                    _draw_heatmap(ax, mat, f"Layer {li} (Head {h_idx}) {tag}")
+            else:
+                for col in range(2):
+                    ax = axes[row, col]
+                    ax.text(0.5, 0.5, "N/A", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=8, color="grey")
+                    ax.set_title(f"Layer {li}", fontsize=7)
+        layers_str = f"L{page_layers[0]}–{page_layers[-1]}"
+        fig.suptitle(f"Student Kernel (softmax'd) ({layers_str}) — Step {step}", fontsize=10)
+        plt.tight_layout()
+        fpath = os.path.join(out_dir, f"student_step_{step:07d}_p{page_idx:02d}.png")
+        fig.savefig(fpath, bbox_inches="tight", dpi=80)
+        plt.close(fig)
+        print(f"[VIZ] Student p{page_idx} → {fpath}")
+
+
+def plot_loss_curve(
+    loss_history: list,     # list of (step, loss, loss_m2t, loss_t2t)
+    seq_len_history: list,  # list of (step, avg_seq_len)
+    out_dir: str,
+    step: int,
+) -> None:
+    """
+    Saves loss_step_XXXXXXX.png with two subplots:
+      - Top: combined / M2T / T2T loss over training steps
+      - Bottom: running average effective sequence length per batch
+    """
+    if not loss_history:
         return
+    os.makedirs(out_dir, exist_ok=True)
 
-    fig = plt.figure(figsize=(15, 4 * n_layers))
-    gs = gridspec.GridSpec(n_layers, 3, figure=fig, hspace=0.4, wspace=0.3)
+    steps_l, losses, losses_m2t, losses_t2t = zip(*loss_history)
 
-    for row, li in enumerate(sorted(layer_ids)):
-        t_w = teacher_weights.get(li)   # (H, L, L) or None
-        s_w = student_weights.get(li)   # (H, L, L) or None
+    n_plots = 2 if seq_len_history else 1
+    fig, axes = plt.subplots(n_plots, 1, figsize=(10, 4 * n_plots))
+    if n_plots == 1:
+        axes = [axes]
 
-        # Average over heads and truncate
-        def _prep(w):
-            if w is None:
-                return None
-            L = min(w.shape[-1], max_len)
-            return w.float().mean(0)[:L, :L].numpy()
+    # ── Loss curves ───────────────────────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(steps_l, losses,     label="Combined", color="#4c9be8", linewidth=1.2)
+    ax.plot(steps_l, losses_m2t, label="M2T",      color="#e8874c", linewidth=0.8, alpha=0.8)
+    ax.plot(steps_l, losses_t2t, label="T2T",      color="#6ae84c", linewidth=0.8, alpha=0.8)
+    ax.set_ylabel("Loss")
+    ax.set_title(f"Training Loss — Step {step}")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
 
-        t_mat = _prep(t_w)
-        s_mat = _prep(s_w)
+    # ── Average sequence length ───────────────────────────────────────────────
+    if seq_len_history:
+        steps_s, avg_lens = zip(*seq_len_history)
+        ax2 = axes[1]
+        ax2.plot(steps_s, avg_lens, color="#a84ce8", linewidth=1.0)
+        ax2.set_ylabel("Avg non-pad tokens")
+        ax2.set_xlabel("Step")
+        ax2.set_title("Average Effective Sequence Length per Batch")
+        ax2.grid(alpha=0.3)
 
-        # Teacher
-        ax_t = fig.add_subplot(gs[row, 0])
-        if t_mat is not None:
-            im = ax_t.imshow(t_mat, aspect="auto", cmap="viridis", vmin=0)
-            plt.colorbar(im, ax=ax_t, fraction=0.03)
-        else:
-            ax_t.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_t.transAxes)
-        ax_t.set_title(f"L{li} Teacher (step {step})", fontsize=8)
-        ax_t.set_xlabel("Key pos"); ax_t.set_ylabel("Query pos")
-
-        # Student
-        ax_s = fig.add_subplot(gs[row, 1])
-        if s_mat is not None:
-            im = ax_s.imshow(s_mat, aspect="auto", cmap="viridis", vmin=0)
-            plt.colorbar(im, ax=ax_s, fraction=0.03)
-        else:
-            ax_s.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_s.transAxes)
-        ax_s.set_title(f"L{li} Student kernel (step {step})", fontsize=8)
-        ax_s.set_xlabel("Key pos"); ax_s.set_ylabel("Query pos")
-
-        # Difference
-        ax_d = fig.add_subplot(gs[row, 2])
-        if t_mat is not None and s_mat is not None:
-            L = min(t_mat.shape[0], s_mat.shape[0])
-            diff = t_mat[:L, :L] - s_mat[:L, :L]
-            vmax = max(abs(diff.min()), abs(diff.max()), 1e-6)
-            im = ax_d.imshow(diff, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-            plt.colorbar(im, ax=ax_d, fraction=0.03)
-        else:
-            ax_d.text(0.5, 0.5, "N/A", ha="center", va="center", transform=ax_d.transAxes)
-        ax_d.set_title(f"L{li} Diff (T − S)", fontsize=8)
-        ax_d.set_xlabel("Key pos"); ax_d.set_ylabel("Query pos")
-
-    fig.suptitle(f"Attention Maps — Step {step}", fontsize=12, y=1.01)
-    fpath = os.path.join(out_dir, f"attn_step_{step:07d}.png")
+    plt.tight_layout()
+    # Always overwrite the same file so you can just refresh one image
+    fpath = os.path.join(out_dir, "loss_curve.png")
     fig.savefig(fpath, bbox_inches="tight", dpi=100)
     plt.close(fig)
-    print(f"\n[VIZ] Saved attention map → {fpath}")
+    print(f"\n[VIZ] Loss curve → {fpath} (step {step})")

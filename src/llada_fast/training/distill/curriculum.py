@@ -14,10 +14,23 @@ from typing import Callable, Dict, List, Optional, Set
 
 import torch
 
-# Default order: start from the middle of a 24-layer model, expand outward.
-DEFAULT_PROG_SEQ = [
-    12, 13, 11, 14, 10, 15, 9, 16, 8, 17, 7, 18, 6, 19, 5, 20, 4, 21, 3, 22, 2, 23, 1, 0
-]
+def generate_prog_seq(n_layers: int) -> List[int]:
+    """Generates a sequence starting from the middle and expanding outwards."""
+    mid = n_layers // 2
+    seq = [mid]
+    for i in range(1, max(mid + 1, n_layers - mid)):
+        # Try higher first, then lower
+        hi = mid + i
+        lo = mid - i
+        if hi < n_layers:
+            seq.append(hi)
+        if lo >= 0:
+            seq.append(lo)
+    return seq
+
+
+# Default order: dynamically generated based on n_layers in CurriculumManager.
+DEFAULT_PROG_SEQ: List[int] = []
 
 
 @dataclass
@@ -62,7 +75,10 @@ class CurriculumManager:
         self.optimizer = optimizer
         self.student = student
         self.revert_layer_fn = revert_layer_fn
-        self.prog_seq = prog_seq
+        if not prog_seq:
+            self.prog_seq = generate_prog_seq(n_layers)
+        else:
+            self.prog_seq = prog_seq
         self.state = self._build_initial_state()
         self._llm_verdict = "FAIL"
 
@@ -173,7 +189,7 @@ class CurriculumManager:
                 p.requires_grad = True
 
             if new_params and next_layer not in self.state.already_in_optimizer:
-                self.optimizer.add_param_group({"params": new_params, "lr": 5e-5})
+                self.optimizer.add_param_group({"params": new_params, "lr": self.cfg.learning_rate})
             self.state.already_in_optimizer.add(next_layer)
             print(f"\n[CURRICULUM] Step {step}: layer {next_layer} activated for linear attention!")
 
@@ -186,5 +202,5 @@ class CurriculumManager:
                 age = step - self.state.layer_activation_steps.get(li, 0)
                 self.state.p_force_dict[li] = max(0.0, 1.0 - age / decay)
             else:
-                # joint mode: no forcing (rely on softmax anchor); otherwise full forcing
-                self.state.p_force_dict[li] = 0.0 if is_joint else 1.0
+                # joint mode or decay=0: no forcing
+                self.state.p_force_dict[li] = 0.0

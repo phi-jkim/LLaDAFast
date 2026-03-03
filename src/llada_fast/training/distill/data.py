@@ -167,12 +167,14 @@ class StreamingTextLoader:
         data = load_dataset(self._name, name=self._subset, split="train", streaming=True)
         self._iter = iter(data)
 
-    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def next_batch(self, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns (input_ids, attention_mask), both shape (1, seq_len).
-        Skips empty examples; blocks until a non-empty example is found.
+        Returns (input_ids, attention_mask), both shape (batch_size, seq_len).
+        Skips empty examples; blocks until batch_size non-empty examples are found.
         """
-        while True:
+        all_ids = []
+        all_masks = []
+        while len(all_ids) < batch_size:
             try:
                 ex = next(self._iter)
             except StopIteration:
@@ -192,4 +194,7 @@ class StreamingTextLoader:
                 truncation=True,
                 padding="max_length",
             )
-            return enc.input_ids, enc.attention_mask
+            all_ids.append(enc.input_ids)
+            all_masks.append(enc.attention_mask)
+        
+        return torch.cat(all_ids, dim=0), torch.cat(all_masks, dim=0)

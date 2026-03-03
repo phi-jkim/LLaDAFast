@@ -363,7 +363,21 @@ class LLaDA2MoeAttention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if getattr(self, "is_linear_active", False) and hasattr(self, "linear_attention"):
+        if output_attentions:
+            # Force eager path to compute explicit weights for visualization/hooks
+            # (SDPA/Flash ignore output_attentions=True and return None).
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
+        elif getattr(self, "is_linear_active", False) and hasattr(self, "linear_attention"):
             # Expand KV heads to Q heads for linear/hybrid attention (GQA → MHA).
             key_states_exp   = repeat_kv(key_states, self.num_key_value_groups)
             value_states_exp = repeat_kv(value_states, self.num_key_value_groups)

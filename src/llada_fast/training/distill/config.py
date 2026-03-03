@@ -14,7 +14,9 @@ class DistillConfig:
 
     # ── Training ──────────────────────────────────────────────────────────────
     num_steps: int = 15000
-    learning_rate: float = 2e-5
+    learning_rate: float = 3e-3
+    batch_size: int = 1
+    grad_accum_steps: int = 1
     device_teacher: str = "cuda:0"
     device_student: str = "cuda:1"
     alpha: float = 1.0          # MSE hidden-state loss weight
@@ -22,6 +24,10 @@ class DistillConfig:
     temperature: float = 1.0    # KL temperature
     omega_mask: float = 0.5     # M2T objective weight within a block step
     omega_edit: float = 0.5     # T2T objective weight within a block step
+    weight_decay: float = 0.0   # Weight decay for AdamW
+    lr_patience: int = 20       # Patience for ReduceLROnPlateau (measured in sequences)
+    lr_factor: float = 0.1      # Factor for ReduceLROnPlateau
+    min_lr: float = 1e-5        # Minimum LR for ReduceLROnPlateau
 
     # ── Architecture ──────────────────────────────────────────────────────────
     distill_layers: Optional[List[int]] = None      # which layers to supervise (default: all)
