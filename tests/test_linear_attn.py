@@ -1,11 +1,13 @@
 import torch
+import torch.nn as nn
 from llada_fast.modeling.linear_attention import OrderInvariantKernelLinearAttention
 
 class MockConfig:
-    def __init__(self, hidden_size=128, num_attention_heads=4):
+    def __init__(self, hidden_size=128, num_attention_heads=4, feature_dim=64):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
+        self.feature_dim = feature_dim
 
 def test_linear_attention_shape():
     config = MockConfig()
@@ -49,12 +51,31 @@ def test_linear_attention_bidirectional_property():
     out2 = attn(q, k, v_mod)
     
     # Output at index 5 (block 0) should change
-    assert not torch.allclose(out1[:, :, 5, :], out2[:, :, 5, :])
+    assert not torch.allclose(out1[:, :, 5, :], out2[:, :, 5, :], atol=1e-5)
     
     # Output at index 40 (block 1) should NOT change
     assert torch.allclose(out1[:, :, 40, :], out2[:, :, 40, :], atol=1e-5)
 
+def test_hedgehog_gradient():
+    """
+    Verify that gradients flow back to the hedgehog_weights.
+    """
+    config = MockConfig()
+    attn = OrderInvariantKernelLinearAttention(config)
+    
+    q = torch.randn(1, config.num_attention_heads, 32, config.head_dim, requires_grad=True)
+    k = torch.randn(1, config.num_attention_heads, 32, config.head_dim, requires_grad=True)
+    v = torch.randn(1, config.num_attention_heads, 32, config.head_dim, requires_grad=True)
+    
+    output = attn(q, k, v)
+    loss = output.sum()
+    loss.backward()
+    
+    assert attn.hedgehog_weights.grad is not None
+    assert not torch.allclose(attn.hedgehog_weights.grad, torch.zeros_like(attn.hedgehog_weights.grad))
+
 if __name__ == "__main__":
     test_linear_attention_shape()
     test_linear_attention_bidirectional_property()
+    test_hedgehog_gradient()
     print("All tests passed!")

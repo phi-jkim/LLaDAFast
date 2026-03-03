@@ -48,7 +48,11 @@ class LLaDA2MoeConfig(PretrainedConfig):
         output_router_logits=False,
         partial_rotary_factor=0.5,
         use_linear_attention=False,
+        use_hybrid_local_softmax=False,
+        use_block_softmax_hybrid=False,
         block_size=32,
+        feature_dim=64,
+        linear_attention_layers=None,
         **kwargs,
     ):
         self.num_hidden_layers = int(num_hidden_layers)
@@ -99,7 +103,11 @@ class LLaDA2MoeConfig(PretrainedConfig):
         self.partial_rotary_factor = float(partial_rotary_factor)
 
         self.use_linear_attention = bool(use_linear_attention)
+        self.use_hybrid_local_softmax = bool(use_hybrid_local_softmax)
+        self.use_block_softmax_hybrid = bool(use_block_softmax_hybrid)
         self.block_size = int(block_size)
+        self.feature_dim = int(feature_dim)
+        self.linear_attention_layers = linear_attention_layers
 
         super().__init__(
             pad_token_id=int(pad_token_id),

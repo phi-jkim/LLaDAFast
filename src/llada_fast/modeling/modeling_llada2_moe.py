@@ -26,6 +26,7 @@ from transformers.generation.utils import GenerationMixin
 
 from .configuration_llada2_moe import LLaDA2MoeConfig
 from .linear_attention import OrderInvariantKernelLinearAttention
+from .hybrid_attention import BlockSoftmaxLinearHybrid
 
 logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "LLaDA2MoeConfig"
@@ -308,9 +309,13 @@ class LLaDA2MoeAttention(nn.Module):
 
         use_linear = getattr(config, "use_linear_attention", False)
         if use_linear:
-            self.linear_attention = OrderInvariantKernelLinearAttention(config, block_size=getattr(config, "block_size", 32))
-            
-        linear_layers = getattr(config, "linear_attention_layers", None)
+            block_size = getattr(config, "block_size", 32)
+            if getattr(config, "use_block_softmax_hybrid", False):
+                self.linear_attention = BlockSoftmaxLinearHybrid(config, block_size=block_size)
+            else:
+                self.linear_attention = OrderInvariantKernelLinearAttention(config, block_size=block_size)
+
+        linear_layers = config.linear_attention_layers
         if linear_layers is not None:
             self.is_linear_active = self.layer_idx in linear_layers
         else:
@@ -359,15 +364,52 @@ class LLaDA2MoeAttention(nn.Module):
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         if getattr(self, "is_linear_active", False) and hasattr(self, "linear_attention"):
-            # IMPORTANT: match KV heads to Q heads (same as eager attention path).
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            # Expand KV heads to Q heads for linear/hybrid attention (GQA → MHA).
+            key_states_exp   = repeat_kv(key_states, self.num_key_value_groups)
+            value_states_exp = repeat_kv(value_states, self.num_key_value_groups)
 
-            attn_output = self.linear_attention(
-                query_states, key_states, value_states, 
-                attention_mask=None, 
-                key_padding_mask=key_padding_mask
-            )
+            # Pass attention_mask and key_padding_mask to the linear attention module.
+            # - OrderInvariantKernelLinearAttention uses key_padding_mask to zero
+            #   padded keys in the recurrent KV-state accumulation.
+            # - BlockSoftmaxLinearHybrid ignores attention_mask (intra-block SDPA
+            #   needs no causal mask; padding zeroed via key_padding_mask → key_valid).
+            # Returns (B, H, L, D); transpose to (B, L, H, D) for dense projection.
+            linear_out = self.linear_attention(
+                query_states, key_states_exp, value_states_exp,
+                attention_mask=attention_mask,
+                key_padding_mask=key_padding_mask,
+            ).transpose(1, 2)
+
+            if isinstance(self.linear_attention, BlockSoftmaxLinearHybrid):
+                # For the hybrid variant, let the hook capture the full blended output
+                # (after the dense projection below) so that shapes match the teacher
+                # hook which also captures after dense: (B, L, hidden_size).
+                # Both alpha and hedgehog_weights still receive gradients through the
+                # MSE loss on the blended output.
+                self._raw_linear_out = None
+                attn_output = linear_out  # blended (B, L, H, D) → reshaped + dense below
+            else:
+                # Legacy softmax anchor ratio (used by joint distillation mode).
+                # Anneals 1.0 → 0.0 during training; 0.0 at inference (no overhead).
+                anchor_ratio = getattr(self, "softmax_anchor_ratio", 0.0)
+                if anchor_ratio > 0.0:
+                    softmax_out, _ = attention_interface(
+                        self,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        dropout=0.0,
+                        scaling=self.scaling,
+                        sliding_window=self.sliding_window,
+                        **kwargs,
+                    )
+                    self._raw_linear_out = None   # keep consistent (B, L, hidden_size) shape
+                    attn_output = (1.0 - anchor_ratio) * linear_out + anchor_ratio * softmax_out
+                else:
+                    self._raw_linear_out = None
+                    attn_output = linear_out
+
             attn_weights = None
         else:
             attn_output, attn_weights = attention_interface(
@@ -391,7 +433,15 @@ class LLaDA2MoeDecoderLayer(nn.Module):
     def __init__(self, config: LLaDA2MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.attention = LLaDA2MoeAttention(config=config, layer_idx=layer_idx)
+        
+        if getattr(config, "use_hybrid_local_softmax", False):
+            from .bidirectional_gated_deltanet import LLaDA2HybridLinearSoftmaxFLAWrapper
+            self.attention = LLaDA2HybridLinearSoftmaxFLAWrapper(config=config, layer_idx=layer_idx)
+        elif getattr(config, "use_bidirectional_gated_deltanet", False):
+            from .bidirectional_gated_deltanet import LLaDA2BidirectionalGatedDeltaNetLayerFLAWrapper
+            self.attention = LLaDA2BidirectionalGatedDeltaNetLayerFLAWrapper(config=config, layer_idx=layer_idx)
+        else:
+            self.attention = LLaDA2MoeAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = (
             LLaDA2MoeSparseMoeBlock(config)
@@ -581,12 +631,11 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
             attention_mask = attention_mask.to(dtype=inputs_embeds.dtype)
 
             if attention_mask.size() == (batch_size, 1, seq_length, seq_length):
-                # This converts 0/1 4D masks into the additive mask format used by SDPA path.
-                attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                    attention_mask,
-                    (batch_size, seq_length),
-                    inputs_embeds,
-                    past_seen_tokens,
+                # Convert 0/1 block mask to additive bias: 0 where attend, -inf where masked.
+                attention_mask = torch.where(
+                    attention_mask.bool(),
+                    torch.zeros_like(attention_mask),
+                    torch.full_like(attention_mask, float("-inf")),
                 )
             else:
                 raise ValueError(
@@ -606,25 +655,18 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                def custom_forward(*inputs):
-                    hs, attn_mask, pos_ids = inputs
-                    return decoder_layer(
-                        hs,
-                        attention_mask=attn_mask,
-                        position_ids=pos_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        output_router_logits=output_router_logits,
-                        use_cache=use_cache,
-                        position_embeddings=position_embeddings,
-                        key_padding_mask=key_padding_mask,
-                        block_attention_mask=block_attention_mask,
-                    )
                 layer_outputs = self._gradient_checkpointing_func(
-                    custom_forward,
+                    decoder_layer.__call__,
                     hidden_states,
                     attention_mask,
                     position_ids,
+                    past_key_values,
+                    output_attentions,
+                    output_router_logits,
+                    use_cache,
+                    position_embeddings,
+                    key_padding_mask,
+                    block_attention_mask,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -747,8 +789,6 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
 
         if not return_dict:
             output = (logits,) + outputs[1:]
-            if output_router_logits:
-                output = (aux_loss,) + output
             return (loss,) + output if loss is not None else output
 
         return MoeCausalLMOutputWithPast(
@@ -798,6 +838,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         eos_id: Optional[int] = None,
         mask_id: Optional[int] = None,
         num_to_transfer: int = 1,
+        repetition_penalty: float = 1.0,
     ):
         steps = min(int(steps), int(gen_length) // int(minimal_topk))
         input_ids = inputs.to(self.device)
@@ -865,6 +906,23 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                 logits = outputs.logits  # (B, W, V)
 
                 active_logits = logits[:, -block_length:, :]
+                
+                if repetition_penalty != 1.0:
+                    for b in range(batch_size):
+                        # Identify tokens already present in the sequence (excluding masks)
+                        past_tokens = x[b, :current_window_end]
+                        unique_tokens = past_tokens[past_tokens != mask_id].unique()
+                        if len(unique_tokens) > 0:
+                            # Apply penalty to the logits for this batch
+                            # active_logits[b] is (block_length, vocab_size)
+                            # We expansion unique_tokens to match block_length
+                            u_toks = unique_tokens.unsqueeze(0).expand(block_length, -1)
+                            scores = torch.gather(active_logits[b], 1, u_toks)
+                            
+                            # Standard penalty: divide positive, multiply negative
+                            scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
+                            active_logits[b].scatter_(1, u_toks, scores)
+
                 x0, x0_p = self._sample_with_temperature_topk_topp(active_logits, temperature=temperature, top_k=top_k, top_p=top_p)
 
                 mask_transfer_index = torch.zeros_like(x0, dtype=torch.bool)

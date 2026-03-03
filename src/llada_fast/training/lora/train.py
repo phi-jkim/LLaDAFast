@@ -57,6 +57,8 @@ def train_lora_step2(
     seq_len: int = 2048,
     omega_mask: float = 0.5,
     omega_edit: float = 0.5,
+    use_gated_deltanet: bool = False,
+    use_hybrid_local_softmax: bool = False,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -73,6 +75,10 @@ def train_lora_step2(
     config = LLaDA2MoeConfig.from_pretrained(model_checkpoint)
     config.use_linear_attention = True
     config.use_qk_norm = True # Stabilization
+    if use_gated_deltanet:
+        config.use_bidirectional_gated_deltanet = True
+    if use_hybrid_local_softmax:
+        config.use_hybrid_local_softmax = True
     block_size = int(getattr(config, "block_size", 32))
 
     model = LLaDA2MoeModelLM.from_pretrained(
@@ -250,4 +256,15 @@ def train_lora_step2(
 
 
 if __name__ == "__main__":
-    train_lora_step2(model_checkpoint="inclusionAI/LLaDA2.1-mini")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--teacher_model", type=str, default="inclusionAI/LLaDA2.1-mini", help="Path to teacher")
+    ap.add_argument("--use_gated_deltanet", action="store_true", help="Use Bidirectional Gated DeltaNet instead of classical linear attention")
+    ap.add_argument("--use_hybrid_local_softmax", action="store_true", help="Use Hybrid Local-Softmax and Global-GDN")
+    args = ap.parse_args()
+    
+    train_lora_step2(
+        model_checkpoint=args.teacher_model,
+        use_gated_deltanet=args.use_gated_deltanet,
+        use_hybrid_local_softmax=args.use_hybrid_local_softmax
+    )

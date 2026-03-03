@@ -7,6 +7,7 @@ import torch.nn.functional as F
 class OrderInvariantKernelLinearAttention(nn.Module):
     """
     Block-causal, bidirectional-within-block kernel linear attention.
+    Implemented with the Hedgehog feature map (LoLCATs style).
 
     Contract with LLaDA2MoeAttention:
       - query/key/value: (B, H, L, D)
@@ -23,27 +24,24 @@ class OrderInvariantKernelLinearAttention(nn.Module):
         self.block_size = int(block_size or getattr(config, "block_size", 32))
         self.eps = float(eps)
 
-        # Learnable feature map params
-        self.phi_scale = nn.Parameter(torch.ones(self.num_heads, 1, self.head_dim))
-        self.phi_bias = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
+        # Hedgehog feature map params
+        self.feature_dim = int(config.feature_dim)
+        # Learnable per-head projection: (H, D, F), initialized as truncated identity
+        weight = torch.eye(self.head_dim, self.feature_dim).unsqueeze(0).expand(
+            self.num_heads, -1, -1
+        )
+        self.hedgehog_weights = nn.Parameter(weight.clone())
 
     @staticmethod
     def _infer_key_valid_from_4d_mask(attention_mask: torch.Tensor, padded_L: int) -> torch.Tensor:
         """
         Returns (B, 1, padded_L, 1) float mask in {0,1}.
-        Works for:
-          - 0/1 masks
-          - bool masks
-          - additive masks (0 / -inf) by treating finite entries as attend
         """
         attn = attention_mask[..., :padded_L, :padded_L]
 
         if attn.dtype == torch.bool:
             attn_bool = attn
         else:
-            # If mask is additive (0/-inf), attend positions are finite (0), blocked are -inf.
-            # If mask is 0/1, attend positions are !=0. We can safely treat finite as attend
-            # only when values contain -inf; otherwise use !=0.
             if torch.isinf(attn).any():
                 attn_bool = torch.isfinite(attn)
             else:
@@ -57,14 +55,26 @@ class OrderInvariantKernelLinearAttention(nn.Module):
         return key_valid.unsqueeze(-1)  # (B, 1, padded_L, 1)
 
     def _feature_map(self, x: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
+        """
+        Hedgehog feature map:
+        1. u = x @ W
+        2. phi(x) = [softmax(u), softmax(-u)]
+        """
         # x: (B, H, N, S, D)
-        # Force params + math to compute_dtype to avoid bf16/float32 mixed einsums.
-        phi_scale = self.phi_scale.to(dtype=compute_dtype)
-        phi_bias = self.phi_bias.to(dtype=compute_dtype)
+        weights = self.hedgehog_weights.to(dtype=compute_dtype)
         x = x.to(dtype=compute_dtype)
-        x = x * phi_scale.unsqueeze(1) + phi_bias.unsqueeze(1)
-        y = F.elu(x) + 1.0  # stays compute_dtype
-        return torch.clamp(y, min=0.0, max=10.0)
+
+        # Linear projection: (B, H, N, S, D) @ (H, D, F) -> (B, H, N, S, F)
+        u = torch.einsum("bhnsd,hdf->bhnsf", x, weights)
+
+        # Activation: concat(softmax(u), softmax(-u)) over the feature dimension
+        # Use float32 for softmax stability
+        u_f32 = u.float()
+        phi = torch.cat(
+            [F.softmax(u_f32, dim=-1), F.softmax(-u_f32, dim=-1)], dim=-1
+        ).to(dtype=compute_dtype)
+
+        return phi
 
     def forward(
         self,
@@ -81,9 +91,8 @@ class OrderInvariantKernelLinearAttention(nn.Module):
         B, H, L, D = query_states.shape
         assert H == self.num_heads and D == self.head_dim
 
-        # Use out_dtype for matmuls (speed) and fp32 for accumulators (stability).
         out_dtype = query_states.dtype
-        compute_dtype = out_dtype 
+        compute_dtype = out_dtype
 
         num_blocks = (L + self.block_size - 1) // self.block_size
         padded_L = num_blocks * self.block_size
@@ -103,9 +112,11 @@ class OrderInvariantKernelLinearAttention(nn.Module):
         k = k.view(B, H, num_blocks, self.block_size, D)
         v = v.view(B, H, num_blocks, self.block_size, D)
 
-        phi_q = self._feature_map(q, compute_dtype)
-        phi_k = self._feature_map(k, compute_dtype)
-        v = v.to(dtype=compute_dtype)
+        phi_q = self._feature_map(q, compute_dtype)  # (B, H, N, S, 2*F)
+        phi_k = self._feature_map(k, compute_dtype)  # (B, H, N, S, 2*F)
+        v = v.to(dtype=compute_dtype)                # (B, H, N, S, D)
+
+        D_feat = 2 * self.feature_dim
 
         # key-valid mask priority: key_padding_mask > infer from 4D attention_mask > None
         key_valid = None
@@ -120,17 +131,17 @@ class OrderInvariantKernelLinearAttention(nn.Module):
                 kpm = F.pad(kpm, (0, padded_L - kpm.shape[-1]), value=0.0)
             key_valid = kpm.unsqueeze(1).unsqueeze(-1)  # (B,1,padded_L,1)
         elif attention_mask is not None:
-            # During model.generate(), LLaDA passes a 4D block-causal mask and NO key_padding_mask.
-            # We MUST infer the valid keys from it, otherwise we attend to the future/padding.
-            key_valid = OrderInvariantKernelLinearAttention._infer_key_valid_from_4d_mask(attention_mask, padded_L)
+            key_valid = OrderInvariantKernelLinearAttention._infer_key_valid_from_4d_mask(
+                attention_mask, padded_L
+            )
 
         if key_valid is not None:
             key_valid = key_valid.to(device=phi_k.device, dtype=compute_dtype)
             key_valid_blocks = key_valid.view(B, 1, num_blocks, self.block_size, 1)
             phi_k = phi_k * key_valid_blocks
             v = v * key_valid_blocks
-        
-        # Correctness: mask internal pad-to-block padding (Fix #5)
+
+        # Correctness: mask internal pad-to-block padding
         if pad_len > 0:
             valid_1d = torch.ones(padded_L, device=phi_k.device, dtype=compute_dtype)
             valid_1d[L:] = 0
@@ -138,32 +149,31 @@ class OrderInvariantKernelLinearAttention(nn.Module):
             phi_k = phi_k * pad_valid
             v = v * pad_valid
 
-        # Recurrent block-causal computation with O(D^2) state (low memory)
-        S_state = torch.zeros(B, H, D, D, dtype=torch.float32, device=phi_k.device)
-        Z_state = torch.zeros(B, H, D, dtype=torch.float32, device=phi_k.device)
+        # Recurrent block-causal computation with O(D_feat * D) state
+        S_state = torch.zeros(B, H, D_feat, D, dtype=torch.float32, device=phi_k.device)
+        Z_state = torch.zeros(B, H, D_feat, dtype=torch.float32, device=phi_k.device)
 
         out_blocks = []
         for n in range(num_blocks):
-            # (B,H,S,D)
-            phi_k_n = phi_k[:, :, n]   # compute_dtype
-            v_n     = v[:, :, n]       # compute_dtype
-            phi_q_n = phi_q[:, :, n]   # compute_dtype
+            # (B,H,S,D_feat)
+            phi_k_n = phi_k[:, :, n]
+            v_n = v[:, :, n]
+            phi_q_n = phi_q[:, :, n]
 
-            # --- update states in fp32 using matmul (usually faster than einsum) ---
-            # S += (D,S) @ (S,D) => (D,D)
+            # --- update states in fp32 ---
+            # S += (D_feat,S) @ (S,D) => (D_feat,D)
             S_state = S_state + torch.matmul(
-                phi_k_n.transpose(-2, -1).float(),   # (B,H,D,S)
-                v_n.float()                          # (B,H,S,D)
+                phi_k_n.transpose(-2, -1).float(), v_n.float()
             )
             # Z += sum over S
-            Z_state = Z_state + phi_k_n.float().sum(dim=-2)  # (B,H,D)
+            Z_state = Z_state + phi_k_n.float().sum(dim=-2)
 
-            # --- compute output in fp32 for stability, cast once ---
-            num = torch.matmul(phi_q_n.float(), S_state)                 # (B,H,S,D)
-            den = torch.matmul(phi_q_n.float(), Z_state.unsqueeze(-1))   # (B,H,S,1)
+            # --- compute output ---
+            num = torch.matmul(phi_q_n.float(), S_state)  # (B,H,S,D)
+            den = torch.matmul(phi_q_n.float(), Z_state.unsqueeze(-1))  # (B,H,S,1)
             den = den.clamp_min(self.eps)
 
-            block_out = (num / den).to(out_dtype)  # back to bf16 once
+            block_out = (num / den).to(out_dtype)
             out_blocks.append(block_out)
 
         out = torch.stack(out_blocks, dim=2).reshape(B, H, padded_L, D)
