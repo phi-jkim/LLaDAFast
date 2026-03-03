@@ -1,52 +1,120 @@
 # LLaDAFast
 
-LLaDAFast is an optimized implementation of [LLaDA 2.1-mini](https://huggingface.co/inclusionAI/LLaDA2.1-mini), featuring **Fully Linear Attention** and **Block-Bidirectional** processing.
+LLaDAFast distills [LLaDA 2.1-mini](https://huggingface.co/inclusionAI/LLaDA2.1-mini) into a faster model using **kernel linear attention** and **hybrid block attention**, trained with a LoLCATs-style teacher-forcing curriculum.
 
-## Highlights
-- **Linear Efficiency**: Replaces standard softmax attention with an order-invariant kernel linear attention.
-- **Frozen-Teacher Distillation**: Learns from the original LLaDA 2.1-mini using a truly frozen teacher strategy on FineWeb-Edu.
-- **LoRA Recovery**: Restores performance via LoRA post-training on UltraChat with the LLaDA denoising/diffusion objective.
+## Method
+
+### Stage 1 — Attention Distillation
+
+A frozen teacher (softmax attention) supervises a student (linear/hybrid attention) layer-by-layer via:
+
+- **Teacher Forcing**: student attention outputs are replaced with the teacher's exact activations during the forward pass, preventing error compounding across layers. Forcing probability decays 1.0 → 0.0 per layer over `--force_decay_length` steps.
+- **M2T (Mask-to-Token)**: present block tokens are randomly masked with `[MASK]`; trains denoising.
+- **T2T (Token-to-Token)**: present block tokens are replaced with random vocab tokens; trains editing/self-correction.
+- **All-blocks training**: every 32-token block in a sequence is used for gradient updates (not just one random block per sequence).
+- **Progressive curriculum**: layers are activated one at a time in middle-out order (layer 12 → 13 → 11 → 14 …), each for `--progressive_interval` steps.
+
+### Stage 2 — LoRA Recovery
+
+Restores generation quality via LoRA fine-tuning on UltraChat with the LLaDA denoising objective.
+
+---
 
 ## Repository Structure
-```text
+
+```
 LLaDAFast/
-├── src/
-│   └── llada_fast/
-│       ├── modeling/      # Optimized linear attention and model definitions
-│       ├── data/          # Dataset loading and packing utilities
-│       ├── training/      # Distillation and LoRA training loops
-│       └── utils/         # Helper functions and configs
-├── configs/               # Training and model configurations
-├── scripts/               # Entrypoint scripts for training/eval
-├── tests/                 # Unit and integration tests
-├── docs/                  # Design documents and benchmarks
-└── README.md
+├── src/llada_fast/
+│   ├── modeling/
+│   │   ├── linear_attention.py          # OrderInvariantKernelLinearAttention (Hedgehog)
+│   │   ├── hybrid_attention.py          # BlockSoftmaxLinearHybrid (past=linear, current=softmax)
+│   │   ├── bidirectional_gated_deltanet.py
+│   │   └── modeling_llada2_moe.py       # LLaDA2MoeModelLM (teacher + student)
+│   └── training/
+│       ├── distill/
+│       │   ├── run.py                   # Stage-1 training loop (entrypoint)
+│       │   ├── config.py                # DistillConfig dataclass
+│       │   ├── data.py                  # corrupt_one_block, corrupt_one_block_t2t, StreamingTextLoader
+│       │   ├── hooks.py                 # TeacherHooks, StudentHooks (forward hooks)
+│       │   ├── curriculum.py            # Progressive layer activation curriculum
+│       │   ├── attn_viz.py              # Attention map visualization (PNG grid)
+│       │   └── llm_judge.py             # LLM-judge quality-gated curriculum (optional)
+│       └── lora/
+│           └── train.py                 # Stage-2 LoRA fine-tuning
+└── scripts/eval/
+    └── perplexity.py
 ```
 
-## Getting Started
+---
 
-### Installation
+## Installation
+
 ```bash
-conda env create -f environment.yml
-conda activate llada_fast
+pip install -e .
+pip install matplotlib  # for attention visualization
 ```
 
-### Distillation (Step 1)
-**Requirements**: This script requires **2 GPUs** (80GB+ each). The Frozen Teacher is loaded on `cuda:0` and the Student on `cuda:1`.
+---
 
-Run the progressive layer-swapping curriculum:
+## Stage 1: Distillation
+
+**Requirements**: 2 GPUs (teacher on `cuda:0`, student on `cuda:1`).
+
+### Pure linear attention (progressive, no LLM judge)
 ```bash
-python src/llada_fast/training/distill.py \
-    --steps 15000 \
-    --lr 5e-5 \
-    --progressive_interval 300 \
-    --force_decay_length 1500
+python -m llada_fast.training.distill.run \
+  --teacher_model inclusionAI/LLaDA2.1-mini \
+  --progressive_interval 500 \
+  --force_decay_length 1000 \
+  --steps 15000 \
+  --lr 2e-5 \
+  --output_dir ./distilled_linear
 ```
 
-### LoRA Recovery (Step 2)
+### Hybrid attention (past blocks = linear, current block = softmax)
 ```bash
-python scripts/train_lora.py --config configs/lora_step2.yaml
+python -m llada_fast.training.distill.run \
+  --teacher_model inclusionAI/LLaDA2.1-mini \
+  --use_block_softmax_hybrid \
+  --progressive_interval 500 \
+  --force_decay_length 1000 \
+  --steps 15000 \
+  --lr 2e-5 \
+  --omega_mask 0.5 \
+  --omega_edit 0.5 \
+  --output_dir ./distilled_hybrid \
+  --plot_attn_every 200 \
+  --plot_attn_max_layers 20 \
+  --plot_attn_max_len 128
 ```
+
+### Key flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--use_block_softmax_hybrid` | off | Hybrid: softmax within current block, linear over past blocks |
+| `--progressive_interval N` | 0 | Activate one new layer every N steps (0 = all layers at once) |
+| `--force_decay_length N` | 1000 | Steps for teacher-forcing probability to decay 1.0 → 0.0 |
+| `--omega_mask` | 0.5 | Weight of M2T (masking) loss objective |
+| `--omega_edit` | 0.5 | Weight of T2T (random-token editing) loss objective |
+| `--alpha` | 1.0 | MSE hidden-state loss weight |
+| `--beta` | 1.0 | KL logit distillation loss weight |
+| `--plot_attn_every N` | 0 | Save attention heatmaps every N steps (0 = off) |
+| `--resume_from PATH` | — | Resume from a saved checkpoint directory |
+
+Checkpoints are saved to `{output_dir}/step_{N}/` every `--save_every` steps.
+Attention maps (PNG) are saved to `{output_dir}/attn_plots/`.
+
+---
+
+## Stage 2: LoRA Recovery
+
+```bash
+python -m llada_fast.training.lora.train --config configs/lora_step2.yaml
+```
+
+---
 
 ## Acknowledgments
-Based on the [LLaDA 2.1](https://github.com/inclusionAI/LLaDA2.X) framework by the InclusionAI team.
+
+Based on [LLaDA 2.1](https://github.com/inclusionAI/LLaDA2.X) by InclusionAI, with distillation design inspired by [LoLCATs](https://github.com/HazyResearch/lolcats) (Hedgehog feature map + teacher-forcing curriculum).
