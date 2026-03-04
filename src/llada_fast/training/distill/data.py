@@ -1,9 +1,14 @@
 """Data utilities for LLaDAFast distillation.
 
 Exports:
-  build_block_causal_mask  — (1,1,L,L) 0/1 block-causal attention mask
-  corrupt_one_block        — "Clean Past, Noisy Present" token corruption
-  StreamingTextLoader      — HF streaming dataset wrapper with auto-reset
+  build_block_causal_mask   — (1,1,L,L) 0/1 block-causal attention mask
+  build_bd3lm_mask          — (1,1,2L,2L) BD3LM staircase attention mask
+  corrupt_one_block         — "Clean Past, Noisy Present" token corruption (single block)
+  corrupt_one_block_t2t     — T2T variant of the above
+  corrupt_all_blocks        — CARD-style: corrupt ALL blocks in one shot (M2T)
+  corrupt_all_blocks_t2t    — CARD-style: corrupt ALL blocks in one shot (T2T)
+  TestSetBuffer             — fixed reserved test set buffered at init
+  StreamingTextLoader       — HF streaming dataset wrapper with auto-reset
 """
 
 import random
@@ -14,25 +19,13 @@ from datasets import load_dataset
 from transformers import PreTrainedTokenizerBase
 
 
-def build_block_causal_mask(
-    seq_len: int,
-    block_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    Returns (1, 1, seq_len, seq_len) block-causal 0/1 mask.
-    Within each block: tokens attend bidirectionally (parallel denoising).
-    Across blocks:     strictly causal (each block sees all past blocks).
-    """
-    num_blocks = (seq_len + block_size - 1) // block_size
-    blk = torch.tril(torch.ones(num_blocks, num_blocks, device=device, dtype=torch.float32))
-    attend = (
-        blk.repeat_interleave(block_size, dim=0)
-           .repeat_interleave(block_size, dim=1)
-           [:seq_len, :seq_len]
-    )
-    return attend.to(dtype=dtype).unsqueeze(0).unsqueeze(0)  # (1, 1, L, L)
+# Re-export mask utilities from the standalone masks module (no heavy deps).
+from llada_fast.modeling.masks import build_block_causal_mask, build_bd3lm_mask
+
+__all__ = [
+    "build_block_causal_mask",
+    "build_bd3lm_mask",
+]
 
 
 def corrupt_one_block(
@@ -141,13 +134,124 @@ def corrupt_one_block_t2t(
 
 
 
-class StreamingTextLoader:
+def corrupt_all_blocks(
+    input_ids: torch.Tensor,        # (B, L)
+    pad_mask: torch.Tensor,         # (B, L)  1=real token, 0=padding
+    mask_id: int,
+    block_size: int,
+    t_per_block: Optional[torch.Tensor] = None,  # (num_blocks,) noise levels; None → random
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Wraps a HuggingFace streaming dataset and tokenizes on-the-fly.
+    CARD-style single-pass M2T corruption: corrupt ALL blocks simultaneously
+    with independent per-block noise levels.
 
-    Automatically resets the iterator when it is exhausted, so training
-    never silently stops mid-run (fixes the StopIteration bug in the
-    original distill.py).
+    Each block gets its tokens randomly replaced with [MASK] at rate t_i.
+    Padding positions are always set to mask_id.
+    Guarantees at least one real unmasked token per block (linear attention stability).
+
+    Returns:
+      noisy     — corrupted input_ids (B, L)
+      corrupted — (B, L) bool tensor, True at positions that were replaced with mask_id
+                  (does NOT include padding; use pad_mask for those)
+    """
+    B, L = input_ids.shape
+    num_blocks = (L + block_size - 1) // block_size
+    dev = input_ids.device
+
+    if t_per_block is None:
+        t_per_block = 0.05 + 0.90 * torch.rand(num_blocks, device=dev)
+
+    # Expand per-block noise levels to per-position: (L,)
+    t_pos = t_per_block.repeat_interleave(block_size)[:L]
+
+    # Sample corruption mask: (B, L)
+    corrupted = torch.rand(B, L, device=dev) < t_pos.unsqueeze(0)
+
+    real_mask = pad_mask.bool()  # (B, L) True = real token
+
+    # Safety: ensure at least one real token per block remains uncorrupted.
+    for bi in range(num_blocks):
+        s = bi * block_size
+        e = min(s + block_size, L)
+        blk_c = corrupted[:, s:e]    # (B, n)
+        blk_r = real_mask[:, s:e]    # (B, n)
+        # Rows where every real position in this block is about to be masked.
+        all_gone = (blk_c & blk_r).all(dim=1) & blk_r.any(dim=1)  # (B,)
+        if all_gone.any():
+            first_real = blk_r.float().argmax(dim=1)  # (B,) index of first real pos
+            bad = all_gone.nonzero(as_tuple=True)[0]
+            corrupted[bad, s + first_real[bad]] = False
+
+    noisy = input_ids.clone()
+    noisy[corrupted] = mask_id     # mask corrupted real positions
+    noisy[~real_mask] = mask_id    # mask padding positions
+
+    return noisy, corrupted
+
+
+def corrupt_all_blocks_t2t(
+    input_ids: torch.Tensor,        # (B, L)
+    pad_mask: torch.Tensor,         # (B, L)  1=real token, 0=padding
+    vocab_ids: torch.Tensor,        # 1-D tensor of valid (non-special) vocab token IDs
+    mask_id: int,
+    block_size: int,
+    t_per_block: Optional[torch.Tensor] = None,  # (num_blocks,) noise levels; None → random
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    CARD-style single-pass T2T corruption: corrupt ALL blocks simultaneously
+    with independent per-block noise levels.
+
+    Each block gets its tokens randomly replaced with random vocab tokens at rate t_i.
+    Padding positions are always set to mask_id.
+    Guarantees at least one real uncorrupted token per block.
+
+    Returns:
+      noisy     — corrupted input_ids (B, L)
+      corrupted — (B, L) bool tensor, True at positions that were replaced with random tokens
+    """
+    B, L = input_ids.shape
+    num_blocks = (L + block_size - 1) // block_size
+    dev = input_ids.device
+
+    if t_per_block is None:
+        t_per_block = 0.05 + 0.90 * torch.rand(num_blocks, device=dev)
+
+    t_pos = t_per_block.repeat_interleave(block_size)[:L]
+    corrupted = torch.rand(B, L, device=dev) < t_pos.unsqueeze(0)  # (B, L)
+
+    real_mask = pad_mask.bool()
+
+    # Safety: at least one real uncorrupted token per block.
+    for bi in range(num_blocks):
+        s = bi * block_size
+        e = min(s + block_size, L)
+        blk_c = corrupted[:, s:e]
+        blk_r = real_mask[:, s:e]
+        all_gone = (blk_c & blk_r).all(dim=1) & blk_r.any(dim=1)
+        if all_gone.any():
+            first_real = blk_r.float().argmax(dim=1)
+            bad = all_gone.nonzero(as_tuple=True)[0]
+            corrupted[bad, s + first_real[bad]] = False
+
+    noisy = input_ids.clone()
+    n_corrupted = int(corrupted.sum().item())
+    if n_corrupted > 0:
+        rand_tokens = vocab_ids[torch.randint(0, vocab_ids.numel(), (n_corrupted,), device=dev)]
+        noisy[corrupted] = rand_tokens
+    noisy[~real_mask] = mask_id    # mask padding positions
+
+    return noisy, corrupted
+
+
+class TestSetBuffer:
+    """
+    Eagerly buffers the first `test_size` non-empty examples from the stream
+    as a fixed, reserved test set.  Training must skip the same raw records.
+
+    Attributes:
+      raw_consumed  — total raw dataset records consumed (including empties).
+                      Pass this to StreamingTextLoader as `skip_first` so the
+                      training stream never overlaps with the test set.
     """
 
     def __init__(
@@ -156,15 +260,86 @@ class StreamingTextLoader:
         dataset_subset: Optional[str],
         tokenizer: PreTrainedTokenizerBase,
         seq_len: int,
+        test_size: int = 256,
+    ):
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self._ids: list = []
+        self._masks: list = []
+        self.raw_consumed: int = 0
+
+        data = load_dataset(dataset_name, name=dataset_subset, split="train", streaming=True)
+        it = iter(data)
+        n_buffered = 0
+        while n_buffered < test_size:
+            try:
+                ex = next(it)
+                self.raw_consumed += 1
+            except StopIteration:
+                break
+            text = ex.get("text") or next(
+                (v for v in ex.values() if isinstance(v, str)), ""
+            )
+            if not text.strip():
+                continue
+            enc = tokenizer(
+                text,
+                return_tensors="pt",
+                max_length=seq_len,
+                truncation=True,
+                padding="max_length",
+            )
+            self._ids.append(enc.input_ids)
+            self._masks.append(enc.attention_mask)
+            n_buffered += 1
+
+        self._n = len(self._ids)
+        print(
+            f"[TestSet] Buffered {self._n} examples "
+            f"(consumed {self.raw_consumed} raw records — training will skip these)."
+        )
+
+    def next_batch(self, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return a random mini-batch sampled (with replacement) from the buffer."""
+        idxs = torch.randint(0, self._n, (batch_size,)).tolist()
+        return (
+            torch.cat([self._ids[i] for i in idxs], dim=0),
+            torch.cat([self._masks[i] for i in idxs], dim=0),
+        )
+
+    def __len__(self) -> int:
+        return self._n
+
+
+class StreamingTextLoader:
+    """
+    Wraps a HuggingFace streaming dataset and tokenizes on-the-fly.
+
+    Pass `skip_first=test_buffer.raw_consumed` so the training stream
+    never overlaps with the reserved test set.
+
+    Automatically resets the iterator when it is exhausted.
+    """
+
+    def __init__(
+        self,
+        dataset_name: str,
+        dataset_subset: Optional[str],
+        tokenizer: PreTrainedTokenizerBase,
+        seq_len: int,
+        skip_first: int = 0,
     ):
         self._name = dataset_name
         self._subset = dataset_subset
         self.tokenizer = tokenizer
         self.seq_len = seq_len
+        self._skip_first = skip_first
         self._reset()
 
     def _reset(self) -> None:
         data = load_dataset(self._name, name=self._subset, split="train", streaming=True)
+        if self._skip_first > 0:
+            data = data.skip(self._skip_first)
         self._iter = iter(data)
 
     def next_batch(self, batch_size: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -182,3 +182,145 @@ class BlockSoftmaxLinearHybrid(nn.Module):
         if pad_len > 0:
             out = out[:, :, :L, :]
         return out
+
+    def forward_bd3lm(
+        self,
+        query_states: torch.Tensor,      # (B, H, 2L, D)
+        key_states: torch.Tensor,        # (B, H, 2L, D)
+        value_states: torch.Tensor,      # (B, H, 2L, D)
+        half_len: int,                   # L — original single-half length
+        key_padding_mask=None,           # (B, 2L) float/bool, 1=real token
+    ) -> torch.Tensor:
+        """
+        BD3LM staircase forward for the hybrid attention.
+
+        Same semantics as OrderInvariantKernelLinearAttention.forward_bd3lm:
+          - Noisy block i queries linear state from clean blocks 0..i-1 only.
+          - State updated with clean block i keys/values.
+          - Clean block i queries updated state (includes self).
+          - Noisy keys are NEVER added to the recurrent state.
+
+        Per block, each stream is:
+          softmax:  bidirectional within-block only (S×S, exact).
+          linear:   cross-block causal context via recurrent state (approximate).
+          output:   sigmoid(alpha) * softmax  +  (1-sigmoid(alpha)) * linear
+
+        Returns (B, H, 2L, D) — [noisy outputs | clean outputs].
+        """
+        B, H, total_L, D = query_states.shape
+        assert total_L == 2 * half_len
+
+        out_dtype = query_states.dtype
+        S = self.block_size
+
+        # ── Split halves ──────────────────────────────────────────────────────
+        q_noisy = query_states[:, :, :half_len, :]   # (B, H, L, D)
+        q_clean = query_states[:, :, half_len:, :]
+        k_noisy = key_states  [:, :, :half_len, :]   # needed for noisy intra-block softmax
+        k_clean = key_states  [:, :, half_len:, :]   # only clean keys enter linear state
+        v_noisy = value_states[:, :, :half_len, :]
+        v_clean = value_states[:, :, half_len:, :]
+
+        num_blocks = (half_len + S - 1) // S
+        padded_L   = num_blocks * S
+        pad_len    = padded_L - half_len
+
+        def _pad_block(x):
+            if pad_len > 0:
+                x = F.pad(x, (0, 0, 0, pad_len))
+            return x.view(B, H, num_blocks, S, D)
+
+        q_noisy = _pad_block(q_noisy)
+        q_clean = _pad_block(q_clean)
+        k_noisy = _pad_block(k_noisy)
+        k_clean = _pad_block(k_clean)
+        v_noisy = _pad_block(v_noisy)
+        v_clean = _pad_block(v_clean)
+
+        # ── Feature maps (phi) for linear stream ─────────────────────────────
+        phi_q_noisy = self._feature_map(q_noisy)   # (B, H, N, S, 2F)
+        phi_q_clean = self._feature_map(q_clean)
+        phi_k_clean = self._feature_map(k_clean)
+        D_feat = 2 * self.feature_dim
+
+        # ── Apply key_padding_mask to clean side only ─────────────────────────
+        if key_padding_mask is not None:
+            kpm = key_padding_mask[:, half_len:].float()   # (B, L)
+            if kpm.shape[-1] < padded_L:
+                kpm = F.pad(kpm, (0, padded_L - kpm.shape[-1]), value=0.0)
+            kv_valid = kpm.view(B, 1, num_blocks, S, 1).to(
+                device=phi_k_clean.device, dtype=phi_k_clean.dtype
+            )
+            phi_k_clean = phi_k_clean * kv_valid
+            v_clean     = v_clean     * kv_valid.to(v_clean.dtype)
+
+        # ── Zero out within-block pad positions ───────────────────────────────
+        if pad_len > 0:
+            valid_1d = torch.ones(padded_L, device=phi_k_clean.device, dtype=phi_k_clean.dtype)
+            valid_1d[half_len:] = 0.0
+            pad_mask_blk = valid_1d.view(1, 1, num_blocks, S, 1)
+            phi_k_clean = phi_k_clean * pad_mask_blk
+            v_clean     = v_clean     * pad_mask_blk.to(v_clean.dtype)
+
+        # ── Recurrent state (fp32) ────────────────────────────────────────────
+        S_state = torch.zeros(B, H, D_feat, D, dtype=torch.float32, device=q_noisy.device)
+        Z_state = torch.zeros(B, H, D_feat,    dtype=torch.float32, device=q_noisy.device)
+
+        w = torch.sigmoid(self.alpha)   # mixing weight
+
+        out_noisy_blocks = []
+        out_clean_blocks = []
+
+        for n in range(num_blocks):
+            q_n_noisy = q_noisy[:, :, n]       # (B, H, S, D)
+            k_n_noisy = k_noisy[:, :, n]
+            v_n_noisy = v_noisy[:, :, n]
+            q_n_clean = q_clean[:, :, n]
+            k_n_clean = k_clean[:, :, n]
+            v_n_clean = v_clean[:, :, n]
+            phi_qn_noisy = phi_q_noisy[:, :, n]   # (B, H, S, 2F)
+            phi_qn_clean = phi_q_clean[:, :, n]
+            phi_kn_clean = phi_k_clean[:, :, n]
+
+            # ── Step A: noisy block queries pre-update state ──────────────────
+            denom_n = torch.matmul(phi_qn_noisy.float(), Z_state.unsqueeze(-1)).clamp_min(self.eps)
+            linear_noisy = (
+                torch.matmul(phi_qn_noisy.float(), S_state) / denom_n
+            ).to(out_dtype)                     # (B, H, S, D)
+
+            # Intra-block softmax over noisy tokens only (bidirectional, exact).
+            softmax_noisy = F.scaled_dot_product_attention(
+                q_n_noisy, k_n_noisy, v_n_noisy,
+                attn_mask=None, dropout_p=0.0, scale=self.scaling,
+            )                                   # (B, H, S, D)
+
+            out_noisy_blocks.append(w * softmax_noisy + (1.0 - w) * linear_noisy)
+
+            # ── Step B: update state with clean block n ───────────────────────
+            S_state = S_state + torch.matmul(
+                phi_kn_clean.transpose(-2, -1).float(), v_n_clean.float()
+            )
+            Z_state = Z_state + phi_kn_clean.float().sum(dim=-2)
+
+            # ── Step C: clean block queries post-update state ─────────────────
+            denom_c = torch.matmul(phi_qn_clean.float(), Z_state.unsqueeze(-1)).clamp_min(self.eps)
+            linear_clean = (
+                torch.matmul(phi_qn_clean.float(), S_state) / denom_c
+            ).to(out_dtype)                     # (B, H, S, D)
+
+            # Intra-block softmax over clean tokens only (bidirectional, exact).
+            softmax_clean = F.scaled_dot_product_attention(
+                q_n_clean, k_n_clean, v_n_clean,
+                attn_mask=None, dropout_p=0.0, scale=self.scaling,
+            )                                   # (B, H, S, D)
+
+            out_clean_blocks.append(w * softmax_clean + (1.0 - w) * linear_clean)
+
+        # ── Reconstruct and return (B, H, 2L, D) ─────────────────────────────
+        out_n = torch.stack(out_noisy_blocks, dim=2).reshape(B, H, padded_L, D)
+        out_c = torch.stack(out_clean_blocks, dim=2).reshape(B, H, padded_L, D)
+        if pad_len > 0:
+            out_n = out_n[:, :, :half_len, :]
+            out_c = out_c[:, :, :half_len, :]
+
+        return torch.cat([out_n, out_c], dim=2)   # (B, H, 2L, D)

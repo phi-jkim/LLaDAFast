@@ -181,3 +181,4 @@ class OrderInvariantKernelLinearAttention(nn.Module):
             out = out[:, :, :L, :]
 
         return out
+

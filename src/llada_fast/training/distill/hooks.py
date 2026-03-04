@@ -6,7 +6,6 @@ StudentHooks  — records student attention outputs and (optionally) replaces th
                 with the teacher's ground truth to prevent error compounding.
 """
 
-import random
 from typing import Dict, List, Sequence
 
 import torch
@@ -76,11 +75,9 @@ class StudentHooks:
         self,
         model,
         layer_ids: Sequence[int],
-        p_force_dict: Dict[int, float],
     ):
         self.record: Dict[int, torch.Tensor] = {}
         self.teacher_targets: Dict[int, torch.Tensor] = {}
-        self.p_force_dict = p_force_dict
         self._handles: List = []
 
         for li in layer_ids:
@@ -94,9 +91,8 @@ class StudentHooks:
                 raw_out = raw_linear if raw_linear is not None else _get_attn_out(out)
                 self.record[_li] = raw_out
 
-                # Teacher forcing: replace student output with teacher ground truth.
-                force_prob = self.p_force_dict.get(_li, 1.0)
-                if _li in self.teacher_targets and random.random() < force_prob:
+                # Teacher forcing: always replace student output with teacher ground truth.
+                if _li in self.teacher_targets:
                     t_val = self.teacher_targets[_li].to(
                         device=raw_out.device, dtype=raw_out.dtype
                     )

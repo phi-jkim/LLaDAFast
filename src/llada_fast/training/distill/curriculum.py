@@ -5,12 +5,11 @@ CurriculumManager handles:
   - Which layers are currently active (being distilled).
   - Layer activation ordering (outward-from-middle by default).
   - Teacher-forcing probability decay per layer.
-  - LLM-judge integration for quality-gated progression.
   - Joint mode: softmax anchor ratio annealing.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 import torch
 
@@ -39,7 +38,6 @@ class CurriculumState:
     active_layers: List[int]
     prog_seq_cursor: int
     layer_activation_steps: Dict[int, int]
-    p_force_dict: Dict[int, float] = field(default_factory=dict)
     consecutive_failures: int = 0
     gen_history: List[Dict] = field(default_factory=list)
     hybrid_ratio_step: int = 0
@@ -53,11 +51,7 @@ class CurriculumManager:
     Modes:
       joint                — all layers active from step 0; anneal softmax anchor ratio.
       progressive_interval — activate one new layer every N steps.
-      use_llm_curriculum_eval — quality-gated progression via LLM judge.
       (none)               — all target layers active from step 0, no progression.
-
-    The `revert_layer_fn` callback is called when a layer is skipped (SKIP verdict).
-    It should revert that layer's weights to the teacher's and freeze its parameters.
     """
 
     def __init__(
@@ -66,7 +60,6 @@ class CurriculumManager:
         n_layers: int,
         optimizer: torch.optim.Optimizer,
         student,
-        revert_layer_fn: Callable[[int], None],
         prog_seq: List[int] = DEFAULT_PROG_SEQ,
     ):
         self._hybrid_mode = getattr(cfg, "use_block_softmax_hybrid", False)
@@ -74,30 +67,20 @@ class CurriculumManager:
         self.n_layers = n_layers
         self.optimizer = optimizer
         self.student = student
-        self.revert_layer_fn = revert_layer_fn
         if not prog_seq:
             self.prog_seq = generate_prog_seq(n_layers)
         else:
             self.prog_seq = prog_seq
         self.state = self._build_initial_state()
-        self._llm_verdict = "FAIL"
 
     # ── Public API ──────────────────────────────────────────────────────────
-
-    def record_verdict(self, verdict: str) -> None:
-        """Call after each eval step with the LLM judge verdict (or 'FAIL' if no eval)."""
-        self._llm_verdict = verdict
 
     def step(self, current_step: int) -> None:
         """Advance curriculum state by one training step."""
         if self.cfg.joint:
             self._step_joint(current_step)
-        elif self.cfg.use_llm_curriculum_eval:
-            self._step_llm(current_step)
         elif self.cfg.progressive_interval > 0:
             self._step_interval(current_step)
-        # Always recompute forcing probabilities.
-        self._update_p_force(current_step)
 
     @property
     def active_layers(self) -> List[int]:
@@ -105,13 +88,14 @@ class CurriculumManager:
 
     @property
     def p_force_dict(self) -> Dict[int, float]:
-        return self.state.p_force_dict
+        """Teacher forcing is always on (p=1.0) for all active layers."""
+        return {li: 1.0 for li in self.state.active_layers}
 
     # ── Internal helpers ────────────────────────────────────────────────────
 
     def _build_initial_state(self) -> CurriculumState:
         cfg = self.cfg
-        if cfg.joint or (not cfg.progressive_interval and not cfg.use_llm_curriculum_eval):
+        if cfg.joint or not cfg.progressive_interval:
             active = cfg.linear_layers if cfg.linear_layers is not None else list(range(self.n_layers))
             return CurriculumState(
                 active_layers=list(active),
@@ -139,29 +123,6 @@ class CurriculumManager:
             self.student.model.layers[li].attention.softmax_anchor_ratio = anchor
         self.state.hybrid_ratio_step += 1
 
-    def _step_llm(self, step: int) -> None:
-        cfg = self.cfg
-        expected = len(self.state.active_layers)
-        if cfg.eval_every > 0 and step % cfg.eval_every == 0 and step > 0:
-            v = self._llm_verdict
-            if v == "PASS":
-                expected += 1
-                self.state.consecutive_failures = 0
-                self.state.gen_history.clear()
-                print(f"\n[CURRICULUM] Step {step}: layer passed LLM judge, activating next.")
-            elif v == "SKIP" or self.state.consecutive_failures >= 12:
-                reason = "SKIP verdict" if v == "SKIP" else "12 consecutive failures"
-                skipped = self.state.active_layers.pop()
-                print(f"\n[CURRICULUM] Step {step}: layer {skipped} skipped ({reason}), reverting.")
-                self.revert_layer_fn(skipped)
-                expected = len(self.state.active_layers) + 1
-                self.state.consecutive_failures = 0
-                self.state.gen_history.clear()
-            else:
-                self.state.consecutive_failures += 1
-                print(f"\n[CURRICULUM] Layer {self.state.active_layers[-1]} "
-                      f"failed ({self.state.consecutive_failures}/12).")
-        self._activate_up_to(expected, step)
 
     def _step_interval(self, step: int) -> None:
         expected = 1 + step // self.cfg.progressive_interval
@@ -192,15 +153,3 @@ class CurriculumManager:
                 self.optimizer.add_param_group({"params": new_params, "lr": self.cfg.learning_rate})
             self.state.already_in_optimizer.add(next_layer)
             print(f"\n[CURRICULUM] Step {step}: layer {next_layer} activated for linear attention!")
-
-    def _update_p_force(self, step: int) -> None:
-        """Recompute teacher-forcing probability for every active layer."""
-        decay = self.cfg.force_decay_length
-        is_joint = self.cfg.joint
-        for li in self.state.active_layers:
-            if decay > 0:
-                age = step - self.state.layer_activation_steps.get(li, 0)
-                self.state.p_force_dict[li] = max(0.0, 1.0 - age / decay)
-            else:
-                # joint mode or decay=0: no forcing
-                self.state.p_force_dict[li] = 0.0

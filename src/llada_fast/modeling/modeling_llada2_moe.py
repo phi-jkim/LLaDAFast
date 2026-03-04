@@ -332,6 +332,7 @@ class LLaDA2MoeAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         block_attention_mask: Optional[torch.Tensor] = None,
+        half_len: Optional[int] = None,
         **kwargs,
     ):
         input_shape = hidden_states.shape[:-1]
@@ -382,17 +383,21 @@ class LLaDA2MoeAttention(nn.Module):
             key_states_exp   = repeat_kv(key_states, self.num_key_value_groups)
             value_states_exp = repeat_kv(value_states, self.num_key_value_groups)
 
-            # Pass attention_mask and key_padding_mask to the linear attention module.
-            # - OrderInvariantKernelLinearAttention uses key_padding_mask to zero
-            #   padded keys in the recurrent KV-state accumulation.
-            # - BlockSoftmaxLinearHybrid ignores attention_mask (intra-block SDPA
-            #   needs no causal mask; padding zeroed via key_padding_mask → key_valid).
-            # Returns (B, H, L, D); transpose to (B, L, H, D) for dense projection.
-            linear_out = self.linear_attention(
-                query_states, key_states_exp, value_states_exp,
-                attention_mask=attention_mask,
-                key_padding_mask=key_padding_mask,
-            ).transpose(1, 2)
+            # BD3LM 2L staircase path: dispatch to forward_bd3lm when half_len is set.
+            # Both pure-linear and hybrid variants have a forward_bd3lm that correctly
+            # uses only clean keys for state accumulation and enforces the staircase.
+            if half_len is not None and hasattr(self.linear_attention, "forward_bd3lm"):
+                linear_out = self.linear_attention.forward_bd3lm(
+                    query_states, key_states_exp, value_states_exp,
+                    half_len=half_len,
+                    key_padding_mask=key_padding_mask,
+                ).transpose(1, 2)
+            else:
+                linear_out = self.linear_attention(
+                    query_states, key_states_exp, value_states_exp,
+                    attention_mask=attention_mask,
+                    key_padding_mask=key_padding_mask,
+                ).transpose(1, 2)
 
             if isinstance(self.linear_attention, BlockSoftmaxLinearHybrid):
                 # For the hybrid variant, let the hook capture the full blended output
@@ -477,6 +482,7 @@ class LLaDA2MoeDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         block_attention_mask: Optional[torch.Tensor] = None,
+        half_len: Optional[int] = None,
         **kwargs,
     ):
         residual = hidden_states
@@ -492,6 +498,7 @@ class LLaDA2MoeDecoderLayer(nn.Module):
             use_cache=use_cache,
             key_padding_mask=key_padding_mask,
             block_attention_mask=block_attention_mask,
+            half_len=half_len,
         )
         hidden_states = residual + hidden_states
 
@@ -592,6 +599,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         key_padding_mask: Optional[torch.Tensor] = None,  # (B, L), optional
+        half_len: Optional[int] = None,  # set to cfg.seq_len for BD3LM 2L training pass
         **kwargs,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         r"""
@@ -681,6 +689,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                     position_embeddings,
                     key_padding_mask,
                     block_attention_mask,
+                    half_len,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -694,6 +703,7 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                     position_embeddings=position_embeddings,
                     key_padding_mask=key_padding_mask,
                     block_attention_mask=block_attention_mask,
+                    half_len=half_len,
                 )
 
             hidden_states = layer_outputs[0]

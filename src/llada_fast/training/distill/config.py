@@ -14,6 +14,7 @@ class DistillConfig:
 
     # ── Training ──────────────────────────────────────────────────────────────
     num_steps: int = 15000
+    gradient_checkpointing: bool = False    # recompute activations during backward (saves ~60% activation memory)
     learning_rate: float = 3e-3
     batch_size: int = 1
     grad_accum_steps: int = 1
@@ -25,9 +26,8 @@ class DistillConfig:
     omega_mask: float = 0.5     # M2T objective weight within a block step
     omega_edit: float = 0.5     # T2T objective weight within a block step
     weight_decay: float = 0.0   # Weight decay for AdamW
-    lr_patience: int = 20       # Patience for ReduceLROnPlateau (measured in sequences)
-    lr_factor: float = 0.1      # Factor for ReduceLROnPlateau
-    min_lr: float = 1e-5        # Minimum LR for ReduceLROnPlateau
+    warmup_steps: int = 200     # Linear warmup steps before cosine decay begins
+    min_lr: float = 1e-5        # Cosine decay floor LR
 
     # ── Architecture ──────────────────────────────────────────────────────────
     distill_layers: Optional[List[int]] = None      # which layers to supervise (default: all)
@@ -39,14 +39,16 @@ class DistillConfig:
 
     # ── Curriculum ────────────────────────────────────────────────────────────
     progressive_interval: int = 0           # steps between activating each new layer
-    force_decay_length: int = 1000          # steps for teacher-forcing prob to decay to 0
-    use_llm_curriculum_eval: bool = False   # use LLM judge for layer progression
 
     # ── Joint / Attention-Surgery mode ────────────────────────────────────────
     joint: bool = False
     hybrid_ratio_start: float = 0.5         # initial softmax anchor fraction
     hybrid_ratio_end: float = 0.0           # final softmax anchor fraction
     hybrid_anneal_steps: int = 5000
+
+    # ── Test set (reserved) ───────────────────────────────────────────────────
+    test_size: int = 256            # examples to reserve from the stream head
+    test_eval_batches: int = 8      # mini-batches to average per test evaluation
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     eval_every: int = 100
@@ -65,7 +67,4 @@ class DistillConfig:
     output_dir: str = "./student_forcing_final"
     resume_from: str = ""
 
-    # ── Attention visualization ────────────────────────────────────────────────
-    plot_attn_every: int = 0           # 0 = disabled; N = save every N steps (from step 0)
-    plot_attn_max_layers: int = 4      # how many active layers to visualize
-    plot_attn_max_len: int = 128       # truncate sequence to this many tokens in plot
+

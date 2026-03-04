@@ -305,49 +305,74 @@ def plot_student_all_layers(
 
 
 def plot_loss_curve(
-    loss_history: list,     # list of (step, loss, loss_m2t, loss_t2t)
-    seq_len_history: list,  # list of (step, avg_seq_len)
+    loss_history: list,             # list of (step, loss, loss_m2t, loss_t2t, ...)
+    seq_len_history: list,          # list of (step, avg_seq_len)
     out_dir: str,
     step: int,
+    ppl_history: Optional[list] = None,  # list of (step, perplexity)
 ) -> None:
     """
-    Saves loss_step_XXXXXXX.png with two subplots:
-      - Top: combined / M2T / T2T loss over training steps
-      - Bottom: running average effective sequence length per batch
+    Saves loss_curve.png with subplots:
+      1. Student masked-denoising perplexity (if ppl_history provided)
+      2. Combined / M2T / T2T distillation loss
+      3. Average effective sequence length per batch (if seq_len_history provided)
     """
     if not loss_history:
         return
     os.makedirs(out_dir, exist_ok=True)
 
-    steps_l, losses, losses_m2t, losses_t2t = zip(*loss_history)
+    steps_l, losses, losses_m2t, losses_t2t = (
+        zip(*loss_history) if loss_history else ([], [], [], [])
+    )
 
-    n_plots = 2 if seq_len_history else 1
+    has_ppl = bool(ppl_history)
+    has_len = bool(seq_len_history)
+    n_plots = 1 + int(has_ppl) + int(has_len)
     fig, axes = plt.subplots(n_plots, 1, figsize=(10, 4 * n_plots))
     if n_plots == 1:
         axes = [axes]
 
-    # ── Loss curves ───────────────────────────────────────────────────────────
-    ax = axes[0]
+    ax_idx = 0
+
+    # ── Perplexity (primary signal) ───────────────────────────────────────────
+    if has_ppl:
+        import math as _math
+        steps_p, ppls = zip(*ppl_history)
+        # Filter out non-finite values for a clean plot.
+        valid = [(s, p) for s, p in zip(steps_p, ppls) if _math.isfinite(p)]
+        if valid:
+            vs, vp = zip(*valid)
+            ax = axes[ax_idx]
+            ax.plot(vs, vp, color="#e84c6a", linewidth=1.4, marker="o",
+                    markersize=3, label="Student PPL")
+            ax.set_ylabel("Perplexity")
+            ax.set_title(f"Student Masked-Denoising Perplexity — Step {step}")
+            ax.legend(fontsize=8)
+            ax.grid(alpha=0.3)
+        ax_idx += 1
+
+    # ── Distillation loss curves ──────────────────────────────────────────────
+    ax = axes[ax_idx]
     ax.plot(steps_l, losses,     label="Combined", color="#4c9be8", linewidth=1.2)
     ax.plot(steps_l, losses_m2t, label="M2T",      color="#e8874c", linewidth=0.8, alpha=0.8)
     ax.plot(steps_l, losses_t2t, label="T2T",      color="#6ae84c", linewidth=0.8, alpha=0.8)
     ax.set_ylabel("Loss")
-    ax.set_title(f"Training Loss — Step {step}")
+    ax.set_title(f"Distillation Loss — Step {step}")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
+    ax_idx += 1
 
     # ── Average sequence length ───────────────────────────────────────────────
-    if seq_len_history:
+    if has_len:
         steps_s, avg_lens = zip(*seq_len_history)
-        ax2 = axes[1]
-        ax2.plot(steps_s, avg_lens, color="#a84ce8", linewidth=1.0)
-        ax2.set_ylabel("Avg non-pad tokens")
-        ax2.set_xlabel("Step")
-        ax2.set_title("Average Effective Sequence Length per Batch")
-        ax2.grid(alpha=0.3)
+        ax = axes[ax_idx]
+        ax.plot(steps_s, avg_lens, color="#a84ce8", linewidth=1.0)
+        ax.set_ylabel("Avg non-pad tokens")
+        ax.set_xlabel("Step")
+        ax.set_title("Average Effective Sequence Length per Batch")
+        ax.grid(alpha=0.3)
 
     plt.tight_layout()
-    # Always overwrite the same file so you can just refresh one image
     fpath = os.path.join(out_dir, "loss_curve.png")
     fig.savefig(fpath, bbox_inches="tight", dpi=100)
     plt.close(fig)
