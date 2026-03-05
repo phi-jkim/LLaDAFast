@@ -271,15 +271,19 @@ class TestHybridForward:
         # pos 3 (same block) changes
         assert not torch.allclose(out1[:, :, 3, :], out2[:, :, 3, :], atol=1e-5)
 
-    def test_softmax_does_not_bleed_across_blocks(self):
-        """With high alpha, block 1 should be unaffected by v change in block 0."""
+    def test_linear_cross_block_always_present(self):
+        """With shared normalization, linear stream always provides cross-block context.
+        Even with high alpha (softmax dominant), block 1 output changes when block 0 V
+        changes, because linear_factor=1 is independent of alpha."""
         attn = self._attn()
-        attn.alpha.data.fill_(10.0)
-        q, k, v = rand_qkv(1, 4, 32, 32)
+        attn.alpha.data.fill_(10.0)  # strongly softmax-dominant
+        q, k, v = rand_qkv(1, 4, 32, 32, seed=42)
         out1 = attn(q, k, v)
-        v2 = v.clone(); v2[:, :, 5, :] += 5.0
+        v2 = v.clone(); v2[:, :, :8, :] += 5.0   # change entire block 0 V
         out2 = attn(q, k, v2)
-        assert torch.allclose(out1[:, :, 12, :], out2[:, :, 12, :], atol=1e-4)
+        # Block 1 must see the update via linear state (cross-block always present)
+        assert not torch.allclose(out1[:, :, 8:16, :], out2[:, :, 8:16, :], atol=1e-4), \
+            "Block 1 should respond to block 0 V change even with high alpha (linear stream)"
 
     def test_cross_block_context_via_linear(self):
         """When alpha=0 (pure linear), block 1 output changes when block 0 v changes."""
@@ -548,7 +552,7 @@ class TestAlphaMixing:
         q, k, v = rand_qkv(1, 4, 8, 32)
         attn(q, k, v).sum().backward()
         assert attn.alpha.grad is not None
-        assert attn.alpha.grad.abs().item() > 0
+        assert attn.alpha.grad.abs().max() > 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -8,8 +8,8 @@ from typing import List, Optional
 class DistillConfig:
     # ── Model / data ──────────────────────────────────────────────────────────
     teacher_model_path: str = "inclusionAI/LLaDA2.1-mini"
-    dataset_name: str = "HuggingFaceFW/fineweb-edu"
-    dataset_subset: Optional[str] = "sample-10BT"
+    dataset_name: str = "yahma/alpaca-cleaned"
+    dataset_subset: Optional[str] = None
     seq_len: int = 1024
 
     # ── Training ──────────────────────────────────────────────────────────────

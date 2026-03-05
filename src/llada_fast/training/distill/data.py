@@ -19,6 +19,33 @@ from datasets import load_dataset
 from transformers import PreTrainedTokenizerBase
 
 
+def _format_example(ex: dict, tokenizer: PreTrainedTokenizerBase) -> str:
+    """
+    Extract and format a dataset example as a plain string.
+
+    Handles two formats:
+      - Alpaca (tatsu-lab/alpaca, yahma/alpaca-cleaned): has instruction/output fields.
+        Formatted with the tokenizer's chat template when available.
+      - FineWeb / generic: has a 'text' field or any string value.
+    """
+    if "instruction" in ex:
+        instruction = ex.get("instruction", "")
+        inp         = ex.get("input", "")
+        output      = ex.get("output", "")
+        content = instruction + ("\n" + inp if inp.strip() else "")
+        if getattr(tokenizer, "chat_template", None) is not None:
+            return tokenizer.apply_chat_template(
+                [{"role": "user",      "content": content},
+                 {"role": "assistant", "content": output}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        return f"### Instruction:\n{content}\n\n### Response:\n{output}"
+    return ex.get("text") or next(
+        (v for v in ex.values() if isinstance(v, str)), ""
+    )
+
+
 # Re-export mask utilities from the standalone masks module (no heavy deps).
 from llada_fast.modeling.masks import build_block_causal_mask, build_bd3lm_mask
 
@@ -277,9 +304,7 @@ class TestSetBuffer:
                 self.raw_consumed += 1
             except StopIteration:
                 break
-            text = ex.get("text") or next(
-                (v for v in ex.values() if isinstance(v, str)), ""
-            )
+            text = _format_example(ex, tokenizer)
             if not text.strip():
                 continue
             enc = tokenizer(
@@ -356,9 +381,7 @@ class StreamingTextLoader:
                 self._reset()
                 ex = next(self._iter)
 
-            text = ex.get("text") or next(
-                (v for v in ex.values() if isinstance(v, str)), ""
-            )
+            text = _format_example(ex, self.tokenizer)
             if not text.strip():
                 continue
 

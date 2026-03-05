@@ -361,6 +361,71 @@ class TestCorruptOneBlock:
         assert (out[0, 20:] == 0).all()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Blockwise Pseudo-Perplexity
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRigorousBlockwisePPL:
+    
+    def test_masking_structure(self):
+        # We simulate the inner logic of _eval_perplexity without running a model
+        block_size = 32
+        seq_len = 120    # 3 full blocks (96) + 1 partial block (24)
+        mask_id = -100
+        dev1 = "cpu"
+        
+        ids_t = torch.arange(1, seq_len + 1).unsqueeze(0)  # (1, 120)  tokens 1 to 120
+        mask_t = torch.ones_like(ids_t)
+        real = mask_t.bool()
+        
+        valid_len = real[0].sum().item()
+        num_blocks = (valid_len + block_size - 1) // block_size
+        assert num_blocks == 4
+        
+        # We'll run the logic multiple times to ensure the selected target block
+        # exhibits the correct properties for past and future
+        for target_block in range(num_blocks):
+            start_idx = target_block * block_size
+            end_idx = min(start_idx + block_size, valid_len)
+            
+            noisy = ids_t.clone()
+            
+            # Future blocks > i: completely masked
+            if end_idx < seq_len:
+                noisy[0, end_idx:] = mask_id
+
+            # Current block i: ~50% random masking
+            block_len = end_idx - start_idx
+            noise_mask = torch.zeros_like(real)
+            block_noise = torch.rand((1, block_len), device=dev1) < 0.5
+            if not block_noise.any():
+                block_noise[0, 0] = True
+            
+            noise_mask[0, start_idx:end_idx] = block_noise
+            noisy[noise_mask] = mask_id
+            
+            # Check 1: Past blocks strictly clean
+            if start_idx > 0:
+                past = noisy[0, :start_idx]
+                past_orig = ids_t[0, :start_idx]
+                assert torch.equal(past, past_orig), f"Block {target_block}: Past tokens should be uncorrupted"
+                
+            # Check 2: Current block partially masked
+            curr = noisy[0, start_idx:end_idx]
+            assert (curr == mask_id).any(), f"Block {target_block}: Current block must have at least one mask token"
+            assert (curr != mask_id).any() or block_len == 1, f"Block {target_block}: Current block should ideally not be entirely masked"
+            
+            # Check 3: Future blocks completely masked
+            if end_idx < seq_len:
+                future = noisy[0, end_idx:]
+                assert (future == mask_id).all(), f"Block {target_block}: Future tokens must be completely masked"
+                
+            # Check 4: Noise mask vector is correctly bounded
+            assert noise_mask[0, :start_idx].sum() == 0, "Noise mask should not overlap past"
+            if end_idx < seq_len:
+                assert noise_mask[0, end_idx:].sum() == 0, "Noise mask should not overlap future"
+                
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

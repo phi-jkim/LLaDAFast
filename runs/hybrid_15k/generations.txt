@@ -1,0 +1,48 @@
+
+=== Step 104 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 104 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 200 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 304 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 400 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 504 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the air hung
+
+=== Step 600 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the air hung
+
+=== Step 704 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 800 ===
+Prompt: Write a story about a fast cat.
+Student: The air in the alley hung
+
+=== Step 904 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 1000 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind
+
+=== Step 1104 ===
+Prompt: Write a story about a fast cat.
+Student: The dust in the alley behind old paper, ink, and the faintest lingering scent of rain rain.

@@ -359,13 +359,15 @@ class TestNumericalLinearAttention:
 
 class TestNumericalHybridForward:
     """
-    For a single block (num_blocks=1), the linear prior state is zero,
-    so the output is exactly:
-        w * sdpa(q, k, v)
-    where w = sigmoid(alpha).
+    Shared-normalization blend (LoLCATs-style):
+      out = (w * sm_num + lin_num) / (w * sm_den + lin_den)
+
+    For a single block (num_blocks=1) the linear prior state is zero, so
+      out = w * sm_num / (w * sm_den + eps)  ≈ sdpa  (NOT w * sdpa)
     """
 
-    def test_single_block_equals_w_times_sdpa(self):
+    def test_single_block_exact_formula(self):
+        """Single block, zero linear state: exact shared-norm formula (not w*sdpa)."""
         from llada_fast.modeling.hybrid_attention import BlockSoftmaxLinearHybrid
         S = 4; D = 4; H = 2
         cfg = make_cfg(H=H, D=D, F=2, S=S)
@@ -374,28 +376,34 @@ class TestNumericalHybridForward:
         torch.manual_seed(7)
         alpha_val = 2.0
         attn.alpha.data.fill_(alpha_val)
-        w = torch.sigmoid(torch.tensor(alpha_val)).item()
+        w = torch.sigmoid(torch.tensor(alpha_val))
 
         q = torch.randn(1, H, S, D)
         k = torch.randn(1, H, S, D)
         v = torch.randn(1, H, S, D)
 
         with torch.no_grad():
-            out = attn(q, k, v)       # (1, H, S, D)
-            sdpa_ref = F.scaled_dot_product_attention(q, k, v, scale=attn.scaling)
+            out = attn(q, k, v)
 
-        expected = w * sdpa_ref
+        # Reference: w * sm_num / (w * sm_den + eps)  [lin_num=0, lin_den=eps]
+        scores = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling
+        scores_max = scores.amax(dim=-1, keepdim=True)
+        a_sm = torch.exp(scores - scores_max)
+        sm_num = torch.matmul(a_sm, v.float())
+        sm_den = a_sm.sum(dim=-1, keepdim=True).clamp_min(attn.eps)
+        expected = (w * sm_num / (w * sm_den + attn.eps)).to(q.dtype)
+
         assert torch.allclose(out, expected, atol=1e-5), \
             f"Max error: {(out - expected).abs().max():.2e}"
 
-    def test_two_blocks_block0_equals_w_sdpa(self):
-        """Block 0 still has zero prior state → same as above."""
+    def test_two_blocks_block0_exact_formula(self):
+        """Block 0 has zero prior state — same shared-norm formula as single block."""
         from llada_fast.modeling.hybrid_attention import BlockSoftmaxLinearHybrid
         S = 4; D = 4; H = 2
         cfg = make_cfg(H=H, D=D, F=2, S=S)
         attn = BlockSoftmaxLinearHybrid(cfg, block_size=S)
-        attn.alpha.data.fill_(0.0)   # w = 0.5
-        w = 0.5
+        attn.alpha.data.fill_(0.0)
+        w = torch.sigmoid(torch.tensor(0.0))
 
         torch.manual_seed(8)
         q = torch.randn(1, H, 2*S, D)
@@ -404,19 +412,24 @@ class TestNumericalHybridForward:
 
         with torch.no_grad():
             out = attn(q, k, v)
-            sdpa_b0 = F.scaled_dot_product_attention(
-                q[:, :, :S, :], k[:, :, :S, :], v[:, :, :S, :], scale=attn.scaling
-            )
 
-        expected_b0 = w * sdpa_b0  # linear_out = 0 for block 0
+        # Reference for block 0: w * sm_num / (w * sm_den + eps)
+        q0, k0, v0 = q[:, :, :S, :], k[:, :, :S, :], v[:, :, :S, :]
+        scores = torch.matmul(q0, k0.transpose(-1, -2)) * attn.scaling
+        scores_max = scores.amax(dim=-1, keepdim=True)
+        a_sm = torch.exp(scores - scores_max)
+        sm_num = torch.matmul(a_sm, v0.float())
+        sm_den = a_sm.sum(dim=-1, keepdim=True).clamp_min(attn.eps)
+        expected_b0 = (w * sm_num / (w * sm_den + attn.eps)).to(q.dtype)
+
         assert torch.allclose(out[:, :, :S, :], expected_b0, atol=1e-5), \
             f"Block 0 max error: {(out[:, :, :S, :] - expected_b0).abs().max():.2e}"
 
-    def test_two_blocks_block1_linear_term(self):
+    def test_two_blocks_block1_shared_norm(self):
         """
-        Block 1: linear_out_1 = φ(q_1) @ S_state / φ(q_1) @ Z_state
-        where S_state, Z_state come from block 0.
-        Full output = w*sdpa_1 + (1-w)*linear_1.
+        Block 1: shared-norm formula with linear state from block 0.
+          out = (w*sm_num_1 + lin_num_1) / (w*sm_den_1 + lin_den_1)
+        This is NOT equal to w*sdpa + (1-w)*linear.
         """
         from llada_fast.modeling.hybrid_attention import BlockSoftmaxLinearHybrid
         S = 4; D = 4; H = 1; F_ = 2
@@ -424,10 +437,9 @@ class TestNumericalHybridForward:
         attn = BlockSoftmaxLinearHybrid(cfg, block_size=S)
         alpha_val = 0.0
         attn.alpha.data.fill_(alpha_val)
-        w = torch.sigmoid(torch.tensor(alpha_val)).item()  # 0.5
+        w = torch.sigmoid(torch.tensor(alpha_val))
 
         torch.manual_seed(9)
-        # Use predictable weights
         W = attn.hedgehog_weights.data[0]   # (D, F)
 
         q = torch.randn(1, H, 2*S, D)
@@ -437,33 +449,33 @@ class TestNumericalHybridForward:
         with torch.no_grad():
             out = attn(q, k, v)
 
-        # Reference: compute block 1 output manually
         def phi(x):
             """x: (S, D) → (S, 2F)"""
-            u = x @ W
-            return torch.cat([F.softmax(u.float(), dim=-1),
-                               F.softmax(-u.float(), dim=-1)], dim=-1).double()
+            u = x.float() @ W.float()
+            return torch.cat([F.softmax(u, dim=-1), F.softmax(-u, dim=-1)], dim=-1)
 
-        k0 = k[0, 0, :S, :].double()
-        v0 = v[0, 0, :S, :].double()
-        q1 = q[0, 0, S:, :].double()
-        k1 = k[0, 0, S:, :].double()
-        v1 = v[0, 0, S:, :].double()
+        k0, v0 = k[0, 0, :S, :], v[0, 0, :S, :]
+        q1, k1, v1 = q[0, 0, S:, :], k[0, 0, S:, :], v[0, 0, S:, :]
 
-        phi_k0 = phi(k0.float())
-        phi_q1 = phi(q1.float())
+        # Linear state from block 0
+        phi_k0 = phi(k0)                           # (S, 2F)
+        S_state = phi_k0.T @ v0.float()            # (2F, D)
+        Z_state = phi_k0.float().sum(dim=0)        # (2F,)
 
-        S_state = phi_k0.T @ v0           # (2F, D)
-        Z_state = phi_k0.sum(dim=0)       # (2F,)
+        # Linear num/den for block 1
+        phi_q1 = phi(q1)                           # (S, 2F)
+        lin_num = phi_q1 @ S_state                 # (S, D)
+        lin_den = (phi_q1 @ Z_state.unsqueeze(-1)).clamp_min(attn.eps)  # (S, 1)
 
-        denom   = (phi_q1 @ Z_state.unsqueeze(-1)).clamp_min(1e-6)
-        lin1    = (phi_q1 @ S_state / denom).float()  # (S, D)
+        # Softmax num/den for block 1
+        scores = (q1.float() @ k1.float().T) * attn.scaling
+        scores_max = scores.amax(dim=-1, keepdim=True)
+        a_sm = torch.exp(scores - scores_max)
+        sm_num = a_sm @ v1.float()                 # (S, D)
+        sm_den = a_sm.sum(dim=-1, keepdim=True).clamp_min(attn.eps)  # (S, 1)
 
-        sdpa_b1 = F.scaled_dot_product_attention(
-            q[:, :, S:, :], k[:, :, S:, :], v[:, :, S:, :], scale=attn.scaling
-        )[0, 0]  # (S, D)
-
-        expected_b1 = (w * sdpa_b1 + (1 - w) * lin1)
+        # Shared-norm output
+        expected_b1 = ((w * sm_num + lin_num) / (w * sm_den + lin_den)).float()
 
         assert torch.allclose(out[0, 0, S:, :], expected_b1, atol=1e-4), \
             f"Block 1 max error: {(out[0, 0, S:, :] - expected_b1).abs().max():.2e}"
@@ -478,31 +490,30 @@ class TestNumericalHybridBD3LM:
     Smallest possible case: 1 noisy block + 1 clean block (half_len = S).
     Total sequence = 2S tokens: noisy[0..S-1], clean[S..2S-1].
 
-    Expected:
+    Shared-norm formula:  out = (w*sm_num + lin_num) / (w*sm_den + lin_den)
+
       noisy block 0:
-        - linear state before = 0 → linear_out_noisy_0 = 0
-        - softmax = sdpa(q_noisy, k_noisy, v_noisy)
-        - out_noisy = w * softmax_noisy + (1-w) * 0 = w * softmax_noisy
+        - linear state before = 0 → lin_num=0, lin_den=eps
+        - out_noisy = w*sm_num / (w*sm_den + eps)  ≈ sdpa_noisy  (NOT w*sdpa)
 
       clean block 0:
-        - state updated with clean block 0 FIRST:
+        - state updated with clean block 0 FIRST (Step B):
             S_state += phi_k_clean0^T @ v_clean0
-            Z_state += phi_k_clean0.sum()
-        - query post-update state:
-            linear_out_clean_0 = phi_q_clean0 @ S_state / phi_q_clean0 @ Z_state
-        - softmax = sdpa(q_clean, k_clean, v_clean)
-        - out_clean = w * softmax_clean + (1-w) * linear_clean
+        - query post-update state (Step C):
+            lin_num = phi_q_clean0 @ S_state
+            lin_den = phi_q_clean0 @ Z_state
+        - out_clean = (w*sm_num_c + lin_num) / (w*sm_den_c + lin_den)
     """
 
-    def test_noisy_block0_output_exact(self):
-        """With no prior state, noisy block 0 out = w * sdpa(q_n, k_n, v_n)."""
+    def test_noisy_block0_exact_formula(self):
+        """Noisy block 0, zero prior state: shared-norm formula (not w*sdpa)."""
         from llada_fast.modeling.hybrid_attention import BlockSoftmaxLinearHybrid
         S = 4; D = 4; H = 1
         cfg = make_cfg(H=H, D=D, F=2, S=S)
         attn = BlockSoftmaxLinearHybrid(cfg, block_size=S)
         alpha_val = 1.5
         attn.alpha.data.fill_(alpha_val)
-        w = torch.sigmoid(torch.tensor(alpha_val)).item()
+        w = torch.sigmoid(torch.tensor(alpha_val))
 
         torch.manual_seed(11)
         q = torch.randn(1, H, 2*S, D)
@@ -512,20 +523,22 @@ class TestNumericalHybridBD3LM:
         with torch.no_grad():
             out = attn.forward_bd3lm(q, k, v, half_len=S)
 
-        sdpa_noisy = F.scaled_dot_product_attention(
-            q[:, :, :S, :], k[:, :, :S, :], v[:, :, :S, :], scale=attn.scaling
-        )
-        expected = w * sdpa_noisy
+        # Reference: w*sm_num / (w*sm_den + eps)  [lin_num=0, lin_den=eps]
+        qn, kn, vn = q[:, :, :S, :], k[:, :, :S, :], v[:, :, :S, :]
+        scores = torch.matmul(qn, kn.transpose(-1, -2)) * attn.scaling
+        scores_max = scores.amax(dim=-1, keepdim=True)
+        a_sm = torch.exp(scores - scores_max)
+        sm_num = torch.matmul(a_sm, vn.float())
+        sm_den = a_sm.sum(dim=-1, keepdim=True).clamp_min(attn.eps)
+        expected = (w * sm_num / (w * sm_den + attn.eps)).to(q.dtype)
+
         assert torch.allclose(out[:, :, :S, :], expected, atol=1e-5), \
             f"Noisy block 0 max error: {(out[:, :, :S, :] - expected).abs().max():.2e}"
 
-    def test_clean_block0_output_exact(self):
+    def test_clean_block0_shared_norm(self):
         """
-        Clean block 0 reads state AFTER updating with itself:
-          S_state = phi_k_clean^T @ v_clean
-          Z_state = phi_k_clean.sum()
-          lin_clean = phi_q_clean @ S_state / phi_q_clean @ Z_state
-          out_clean = w*sdpa_clean + (1-w)*lin_clean
+        Clean block 0 reads state AFTER updating with itself (Step B then C).
+        Shared-norm formula: (w*sm_num_c + lin_num) / (w*sm_den_c + lin_den)
         """
         from llada_fast.modeling.hybrid_attention import BlockSoftmaxLinearHybrid
         S = 4; D = 4; H = 1; F_ = 2
@@ -533,7 +546,7 @@ class TestNumericalHybridBD3LM:
         attn = BlockSoftmaxLinearHybrid(cfg, block_size=S)
         alpha_val = 0.0
         attn.alpha.data.fill_(alpha_val)
-        w = 0.5
+        w = torch.sigmoid(torch.tensor(alpha_val))
 
         torch.manual_seed(12)
         W = attn.hedgehog_weights.data[0]   # (D, F)
@@ -550,27 +563,29 @@ class TestNumericalHybridBD3LM:
             u = x.float() @ W.float()
             return torch.cat([F.softmax(u, dim=-1), F.softmax(-u, dim=-1)], dim=-1)
 
-        # Clean block 0: global positions S..2S-1
         k_clean = k[0, 0, S:, :]  # (S, D)
         v_clean = v[0, 0, S:, :]  # (S, D)
         q_clean = q[0, 0, S:, :]  # (S, D)
 
-        phi_k_c = phi(k_clean).double()
-        phi_q_c = phi(q_clean).double()
-        v_c     = v_clean.double()
+        # State updated with clean block 0 (Step B)
+        phi_k_c = phi(k_clean)
+        phi_q_c = phi(q_clean)
+        S_state = phi_k_c.T @ v_clean.float()       # (2F, D)
+        Z_state = phi_k_c.float().sum(dim=0)        # (2F,)
 
-        # State after clean block 0 update (before noisy contributed anything)
-        S_state = phi_k_c.T @ v_c                   # (2F, D)
-        Z_state = phi_k_c.sum(dim=0)                # (2F,)
+        # Linear num/den (Step C)
+        lin_num = phi_q_c @ S_state                               # (S, D)
+        lin_den = (phi_q_c @ Z_state.unsqueeze(-1)).clamp_min(attn.eps)  # (S, 1)
 
-        denom    = (phi_q_c @ Z_state.unsqueeze(-1)).clamp_min(1e-6)
-        lin_clean = (phi_q_c @ S_state / denom).float()  # (S, D)
+        # Softmax num/den for clean block
+        qc, kc, vc = q[:, :, S:, :], k[:, :, S:, :], v[:, :, S:, :]
+        scores = torch.matmul(qc, kc.transpose(-1, -2)) * attn.scaling
+        scores_max = scores.amax(dim=-1, keepdim=True)
+        a_sm = torch.exp(scores - scores_max)
+        sm_num = torch.matmul(a_sm, vc.float())[0, 0]            # (S, D)
+        sm_den = a_sm.sum(dim=-1, keepdim=True).clamp_min(attn.eps)[0, 0]  # (S, 1)
 
-        sdpa_clean = F.scaled_dot_product_attention(
-            q[:, :, S:, :], k[:, :, S:, :], v[:, :, S:, :], scale=attn.scaling
-        )[0, 0]
-
-        expected_clean = w * sdpa_clean + (1 - w) * lin_clean
+        expected_clean = ((w * sm_num + lin_num) / (w * sm_den + lin_den)).float()
 
         assert torch.allclose(out[0, 0, S:, :], expected_clean, atol=1e-4), \
             f"Clean block 0 max error: {(out[0, 0, S:, :] - expected_clean).abs().max():.2e}"
@@ -608,40 +623,60 @@ class TestNumericalHybridBD3LM:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestNumericalAlpha:
-    """Verify the exact sigmoid blend formula."""
+    """
+    Verify the shared-norm formula for various alpha values.
 
-    def test_sigmoid_0_is_half(self):
+    Single block (zero linear state): out = w*sm_num / (w*sm_den + eps)
+    This is approximately sdpa for any non-negligible w (NOT w*sdpa).
+    """
+
+    def test_alpha_0_single_block_approx_sdpa(self):
+        """alpha=0 → w=0.5: single-block output ≈ sdpa (shared-norm cancels w)."""
         from llada_fast.modeling.hybrid_attention import BlockSoftmaxLinearHybrid
         S = 4; D = 4; H = 1
         attn = BlockSoftmaxLinearHybrid(make_cfg(H=H, D=D, F=2, S=S), block_size=S)
         attn.alpha.data.fill_(0.0)
+        w = torch.sigmoid(torch.tensor(0.0))  # 0.5
 
         torch.manual_seed(14)
         q, k, v = [torch.randn(1, H, S, D) for _ in range(3)]
 
         with torch.no_grad():
-            out = attn(q, k, v)                  # single block → linear_out=0
-            sdpa = F.scaled_dot_product_attention(q, k, v, scale=attn.scaling)
+            out = attn(q, k, v)   # single block → linear prior = 0
 
-        # w = sigmoid(0) = 0.5 exactly
-        assert torch.allclose(out, 0.5 * sdpa, atol=1e-6), \
-            f"alpha=0 → w=0.5 blend failed: max error {(out - 0.5*sdpa).abs().max():.2e}"
+        # Exact reference: w*sm_num / (w*sm_den + eps)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling
+        scores_max = scores.amax(dim=-1, keepdim=True)
+        a_sm = torch.exp(scores - scores_max)
+        sm_num = torch.matmul(a_sm, v.float())
+        sm_den = a_sm.sum(dim=-1, keepdim=True).clamp_min(attn.eps)
+        expected = (w * sm_num / (w * sm_den + attn.eps)).to(q.dtype)
 
-    def test_sigmoid_value_matches_pytorch(self):
+        assert torch.allclose(out, expected, atol=1e-6), \
+            f"alpha=0 shared-norm failed: max error {(out - expected).abs().max():.2e}"
+
+    def test_single_block_exact_shared_norm(self):
+        """For single block, exact shared-norm formula matches for all alpha values."""
         from llada_fast.modeling.hybrid_attention import BlockSoftmaxLinearHybrid
         for alpha_val in [-3.0, -1.0, 0.0, 1.0, 2.5, 4.0]:
             S = 4; D = 4; H = 1
             attn = BlockSoftmaxLinearHybrid(make_cfg(H=H, D=D, F=2, S=S), block_size=S)
             attn.alpha.data.fill_(alpha_val)
+            w = torch.sigmoid(torch.tensor(alpha_val))
 
             torch.manual_seed(15)
             q, k, v = [torch.randn(1, H, S, D) for _ in range(3)]
             with torch.no_grad():
                 out = attn(q, k, v)
-                sdpa = F.scaled_dot_product_attention(q, k, v, scale=attn.scaling)
 
-            w = torch.sigmoid(torch.tensor(alpha_val)).item()
-            expected = w * sdpa   # single block, linear prior = 0
+            # Exact reference: w*sm_num / (w*sm_den + eps)
+            scores = torch.matmul(q, k.transpose(-1, -2)) * attn.scaling
+            scores_max = scores.amax(dim=-1, keepdim=True)
+            a_sm = torch.exp(scores - scores_max)
+            sm_num = torch.matmul(a_sm, v.float())
+            sm_den = a_sm.sum(dim=-1, keepdim=True).clamp_min(attn.eps)
+            expected = (w * sm_num / (w * sm_den + attn.eps)).to(q.dtype)
+
             assert torch.allclose(out, expected, atol=1e-5), \
                 f"alpha={alpha_val}: max error {(out - expected).abs().max():.2e}"
 

@@ -1,270 +1,371 @@
-# scripts/train_lora_step2.py
+"""Stage-2 LoRA fine-tuning for linearized LLaDA2 (hybrid block from stage 1).
+
+Single-pass M2T + T2T over ALL blocks simultaneously, batch_size=1 with
+gradient accumulation, reserved test set for perplexity. No teacher required.
+Uses Alpaca (instruction data) to match LLaDA2.1-mini's instruct training.
+"""
+import argparse
+import glob
+import math
+import os
+import random
+import shutil
+
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from datasets import load_dataset
-from tqdm import tqdm
-import warnings
-from transformers.utils import logging as hf_logging
-
-# Silence problematic Transformers warning formatting
-warnings.filterwarnings("ignore", category=FutureWarning)
-hf_logging.set_verbosity_error()
-
-# Fix #4: Enable TF32 + “high” matmul precision (Free speed)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision("high")
-
-from peft import LoraConfig, TaskType, get_peft_model
-from llada_fast.modeling.modeling_llada2_moe import LLaDA2MoeModelLM
 from llada_fast.modeling.configuration_llada2_moe import LLaDA2MoeConfig
+from llada_fast.modeling.modeling_llada2_moe import LLaDA2MoeModelLM
+from llada_fast.training.distill.data import (
+    build_block_causal_mask,
+    corrupt_all_blocks,
+    corrupt_all_blocks_t2t,
+)
 
 
-NOISE_LOW, NOISE_HIGH = 0.3, 0.8
+# ── Alpaca data loader ────────────────────────────────────────────────────────
 
-
-def _build_block_causal_mask_proto(seq_len: int, block_size: int, device: torch.device):
-    """Build a (1, 1, L, L) float32 0/1 mask prototype for Block-Parallel Decoding.
-
-    Standard causal masks are triangles (token i sees 0..i).
-    Block-causal masks are 'staircases' of squares:
-    - Tokens are grouped into blocks of `block_size`.
-    - Inside a block, tokens can see each other (full attention square on diagonal).
-    - Tokens cannot see any future blocks.
-    - This allows parallel denoising within a block while maintaining document-level causality.
+class AlpacaLoader:
     """
-    num_blocks = (seq_len + block_size - 1) // block_size
-    # 1. Start with a block-level causal triangle
-    blk = torch.tril(torch.ones(num_blocks, num_blocks, device=device))
-    # 2. Stretch each 1/0 into a block_size x block_size square
-    attend = (
-        blk.repeat_interleave(block_size, dim=0)
-        .repeat_interleave(block_size, dim=1)[:seq_len, :seq_len]
-        .float()
+    Loads tatsu-lab/alpaca, formats each example with the tokenizer's chat
+    template (or a plain fallback), and tokenizes to seq_len.
+
+    First `test_size` examples are reserved as a fixed test set; the remaining
+    examples are shuffled and cycled for training.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        seq_len: int,
+        test_size: int = 256,
+        dataset_name: str = "tatsu-lab/alpaca",
+    ):
+        ds = load_dataset(dataset_name, split="train")
+        has_template = getattr(tokenizer, "chat_template", None) is not None
+
+        texts = []
+        for ex in ds:
+            instruction = ex.get("instruction", "")
+            inp         = ex.get("input", "")
+            output      = ex.get("output", "")
+            content = instruction + ("\n" + inp if inp.strip() else "")
+            if has_template:
+                text = tokenizer.apply_chat_template(
+                    [{"role": "user",      "content": content},
+                     {"role": "assistant", "content": output}],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            else:
+                text = f"### Instruction:\n{content}\n\n### Response:\n{output}"
+            texts.append(text)
+
+        self._texts     = texts
+        self._tok       = tokenizer
+        self._seq_len   = seq_len
+        self._n         = len(texts)
+        self._test_size = min(test_size, self._n // 8)
+
+        train_idx = list(range(self._test_size, self._n))
+        random.shuffle(train_idx)
+        self._train_order = train_idx
+        self._pos = 0
+
+        print(f"[Alpaca] {self._n} examples  "
+              f"test={self._test_size}  train={len(self._train_order)}")
+
+    def _encode(self, text):
+        enc = self._tok(
+            text,
+            truncation=True,
+            max_length=self._seq_len,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        return enc.input_ids, enc.attention_mask   # (1, L), (1, L)
+
+    def next_train(self):
+        if self._pos >= len(self._train_order):
+            random.shuffle(self._train_order)
+            self._pos = 0
+        idx = self._train_order[self._pos]
+        self._pos += 1
+        return self._encode(self._texts[idx])
+
+    def next_test(self):
+        idx = random.randint(0, self._test_size - 1)
+        return self._encode(self._texts[idx])
+
+
+# ── LR scheduler ──────────────────────────────────────────────────────────────
+
+def _build_scheduler(optimizer, num_steps, warmup_steps, min_lr, lr, last_epoch=0):
+    def _lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / max(1, warmup_steps)
+        progress = float(step - warmup_steps) / max(1, num_steps - warmup_steps)
+        cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return (min_lr / lr) + (1.0 - min_lr / lr) * cosine
+    # last_epoch - 1: LambdaLR calls step() once on init, advancing to last_epoch.
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch - 1)
+
+
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+
+def _save(model, optimizer, scheduler, step, output_dir):
+    """Save trainable delta + optimizer. Keeps only the two most recent checkpoints."""
+    pths = sorted(
+        glob.glob(os.path.join(output_dir, "step_*")),
+        key=lambda x: int(x.split("_")[-1]) if x.split("_")[-1].isdigit() else 0,
     )
-    return attend.unsqueeze(0).unsqueeze(0)  # (1,1,L,L)
+    if len(pths) >= 2:
+        for p in pths[:-1]:
+            shutil.rmtree(p, ignore_errors=True)
+
+    out = os.path.join(output_dir, f"step_{step}")
+    os.makedirs(out, exist_ok=True)
+    delta = {n: p.cpu() for n, p in model.named_parameters() if p.requires_grad}
+    torch.save(delta,                       os.path.join(out, "lora_delta.pt"))
+    torch.save(optimizer.state_dict(),      os.path.join(out, "optimizer.pt"))
+    torch.save({"step": step},              os.path.join(out, "train_state.pt"))
+    print(f"\n[SAVE] step_{step}  ({len(delta)} trainable tensors)")
 
 
-def train_lora_step2(
-    model_checkpoint: str,
-    dataset_name: str = "stingning/ultrachat",
-    output_dir: str = "./lora_checkpoints",
-    batch_size: int = 2,
-    learning_rate: float = 1e-5,
-    max_steps: int = 10000,
-    seq_len: int = 2048,
-    omega_mask: float = 0.5,
-    omega_edit: float = 0.5,
-    use_gated_deltanet: bool = False,
-    use_hybrid_local_softmax: bool = False,
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ── Perplexity eval ───────────────────────────────────────────────────────────
 
-    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-    mask_id = getattr(tokenizer, "mask_token_id", None)
-    if mask_id is None:
-        mask_id = 156895
-    pad_id = tokenizer.pad_token_id
+@torch.no_grad()
+def _eval_ppl(model, loader, mask_id, block_size, attn_proto, device, n_batches=16):
+    model.eval()
+    ces = []
+    for _ in range(n_batches):
+        ids, pmask = loader.next_test()
+        ids   = ids.to(device)
+        pmask = pmask.to(device)
 
-    # For T2T noise: exclude special tokens
+        num_blocks  = (ids.shape[1] + block_size - 1) // block_size
+        t_per_block = 0.05 + 0.90 * torch.rand(num_blocks, device=device)
+
+        noisy, corrupted = corrupt_all_blocks(ids, pmask, mask_id, block_size, t_per_block)
+        if not corrupted.any():
+            continue
+
+        out = model(
+            noisy,
+            attention_mask=attn_proto.expand(1, -1, -1, -1),
+            key_padding_mask=pmask.bool(),
+        )
+        ce = F.cross_entropy(out.logits[0][corrupted[0]], ids[0][corrupted[0]])
+        if torch.isfinite(ce):
+            ces.append(ce.item())
+
+    model.train()
+    return math.exp(sum(ces) / len(ces)) if ces else float("nan")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def train(cfg):
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    device = torch.device(cfg.device)
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.teacher_model_path, trust_remote_code=True)
+    mask_id = tokenizer.mask_token_id
+    assert mask_id is not None, "tokenizer must expose mask_token_id"
+
     special_ids = set(tokenizer.all_special_ids)
-    vocab_ids = torch.tensor([i for i in range(tokenizer.vocab_size) if i not in special_ids], dtype=torch.long)
+    vocab_ids = torch.tensor(
+        [i for i in range(tokenizer.vocab_size) if i not in special_ids],
+        dtype=torch.long, device=device,
+    )
 
-    config = LLaDA2MoeConfig.from_pretrained(model_checkpoint)
-    config.use_linear_attention = True
-    config.use_qk_norm = True # Stabilization
-    if use_gated_deltanet:
-        config.use_bidirectional_gated_deltanet = True
-    if use_hybrid_local_softmax:
-        config.use_hybrid_local_softmax = True
+    # ── Build student model ────────────────────────────────────────────────────
+    config = LLaDA2MoeConfig.from_pretrained(cfg.teacher_model_path)
+    config.use_linear_attention    = True
+    config.use_qk_norm             = True
+    config.use_block_softmax_hybrid = True   # stage 1 used hybrid block
     block_size = int(getattr(config, "block_size", 32))
 
     model = LLaDA2MoeModelLM.from_pretrained(
-        model_checkpoint, config=config, torch_dtype=torch.bfloat16, trust_remote_code=True
+        cfg.teacher_model_path, config=config,
+        torch_dtype=torch.bfloat16, trust_remote_code=True,
     )
 
-    # LoRA: attention + MLP projections (do NOT target phi_* via LoRA; unfreeze them directly)
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=16,
-        lora_alpha=32,
+    # Load stage-1 trained delta (hedgehog_weights + alpha)
+    if cfg.stage1_checkpoint:
+        delta_path = os.path.join(cfg.stage1_checkpoint, "linear_attn_delta.pt")
+        if os.path.exists(delta_path):
+            ret = model.load_state_dict(
+                torch.load(delta_path, map_location="cpu"), strict=False
+            )
+            print(f"[INIT] Loaded stage-1 delta. Missing keys: {len(ret.missing_keys)}")
+        else:
+            print(f"[WARN] No delta at {delta_path} — starting from teacher weights.")
+
+    # ── LoRA on base projections ───────────────────────────────────────────────
+    lora_cfg = LoraConfig(
+        r=cfg.lora_rank,
+        lora_alpha=cfg.lora_rank * 2,
         target_modules=["query_key_value", "dense", "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0.05,
         bias="none",
-        inference_mode=False,
     )
-    model = get_peft_model(model, peft_config)
+    model = get_peft_model(model, lora_cfg)
 
-    # Ensure feature-map params train
-    for name, param in model.named_parameters():
-        if "phi_scale" in name or "phi_bias" in name:
-            param.requires_grad = True
+    # Keep linear-attention-specific params trainable (trained in stage 1).
+    for name, p in model.named_parameters():
+        if "hedgehog_weights" in name or name.endswith(".alpha"):
+            p.requires_grad = True
 
     model = model.to(device)
     model.train()
     model.print_trainable_parameters()
 
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=learning_rate)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg.lr, weight_decay=0.01,
+    )
 
-    attn_mask_proto = _build_block_causal_mask_proto(seq_len, block_size, device)
+    # ── Data ──────────────────────────────────────────────────────────────────
+    loader = AlpacaLoader(
+        tokenizer, cfg.seq_len,
+        test_size=cfg.test_size,
+        dataset_name=cfg.alpaca_dataset,
+    )
 
-    has_chat_template = getattr(tokenizer, "chat_template", None) is not None
+    attn_proto = build_block_causal_mask(cfg.seq_len, block_size, device, torch.bfloat16)
 
-    def _to_text_and_prompt(ex):
-        # UltraChat usually has "data": alternating user/assistant turns
-        if "data" in ex:
-            turns = ex["data"]
-            if has_chat_template:
-                messages = [{"role": "user" if idx % 2 == 0 else "assistant", "content": str(t)} for idx, t in enumerate(turns)]
-                full = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                if len(messages) > 1 and messages[-1]["role"] == "assistant":
-                    prompt = tokenizer.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
-                else:
-                    prompt = full
-                return full, prompt
-            # fallback plain join
-            full = " ".join(str(u) for u in turns)
-            prompt = " ".join(str(u) for u in turns[:-1]) if len(turns) > 1 else ""
-            return full, prompt
+    # ── Resume ────────────────────────────────────────────────────────────────
+    step = 0
+    if cfg.resume_from and os.path.exists(cfg.resume_from):
+        ts_path = os.path.join(cfg.resume_from, "train_state.pt")
+        if os.path.exists(ts_path):
+            step = torch.load(ts_path, map_location="cpu").get("step", 0)
+        delta_path = os.path.join(cfg.resume_from, "lora_delta.pt")
+        if os.path.exists(delta_path):
+            model.load_state_dict(
+                torch.load(delta_path, map_location="cpu"), strict=False
+            )
+            print(f"[RESUME] Loaded LoRA delta from {cfg.resume_from}")
+        opt_path = os.path.join(cfg.resume_from, "optimizer.pt")
+        if os.path.exists(opt_path):
+            optimizer.load_state_dict(torch.load(opt_path, map_location=device))
+        print(f"[RESUME] Starting from step {step}")
 
-        # generic dataset fallback
-        return ex.get("text", ""), ""
+    scheduler = _build_scheduler(
+        optimizer, cfg.num_steps, cfg.warmup_steps, cfg.min_lr, cfg.lr,
+        last_epoch=step,
+    )
 
-    def collate(examples):
-        pairs = [_to_text_and_prompt(ex) for ex in examples]
-        texts = [t for t, _ in pairs]
-        prompts = [p for _, p in pairs]
+    # ── Training loop ─────────────────────────────────────────────────────────
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    pbar   = tqdm(total=cfg.num_steps, initial=step)
+    m2t_ema = t2t_ema = None
 
-        enc = tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=seq_len,
-            return_tensors="pt",
-        )
-        B, L = enc.input_ids.shape
-        real_lengths = enc.attention_mask.sum(dim=1).tolist()
-
-        # Replace pad tokens with mask_id so pad never appears as a token (matches inference dist.)
-        x_clean = enc.input_ids.clone()
-        if pad_id is not None:
-            x_clean[x_clean == pad_id] = mask_id
-        for i in range(B):
-            rl = int(real_lengths[i])
-            x_clean[i, rl:] = mask_id  # hard stop beyond real length
-
-        # Compute prompt lengths (token count without special tokens)
-        prompt_lengths = []
-        for p in prompts:
-            if p:
-                plen = len(tokenizer(p, truncation=True, max_length=seq_len, add_special_tokens=False).input_ids)
-            else:
-                plen = 0
-            prompt_lengths.append(plen)
-
-        x_m2t = x_clean.clone()
-        labels_m2t = torch.full((B, L), -100, dtype=torch.long)
-        x_t2t = x_clean.clone()
-        labels_t2t = torch.full((B, L), -100, dtype=torch.long)
-
-        for i in range(B):
-            plen = int(prompt_lengths[i])
-            rlen = int(real_lengths[i])
-
-            if rlen <= plen:
-                continue
-
-            first_resp_block = plen // block_size
-            last_resp_block = max(first_resp_block, (rlen - 1) // block_size)
-            num_resp_blocks = last_resp_block - first_resp_block + 1
-            if num_resp_blocks <= 0:
-                continue
-
-            current_block = first_resp_block + torch.randint(0, num_resp_blocks, (1,)).item()
-            block_start = current_block * block_size
-            block_end = min((current_block + 1) * block_size, rlen)
-            resp_start = max(block_start, plen)
-
-            if resp_start >= block_end:
-                continue
-
-            n_pos = block_end - resp_start
-
-            # M2T (Mask-to-Token): Mask Drafting
-            # This is the "standard" diffusion task. We replace tokens with [MASK] at
-            # a random timestep `t`. The model learns to predict the original token,
-            # which teaches it how to "draft" text from scratch in a block.
-            t = NOISE_LOW + (NOISE_HIGH - NOISE_LOW) * torch.rand(1).item()
-            m2t_mask = torch.rand(n_pos) < t
-            x_m2t[i, resp_start:block_end][m2t_mask] = mask_id
-            labels_m2t[i, resp_start:block_end][m2t_mask] = x_clean[i, resp_start:block_end][m2t_mask]
-
-            # T2T (Token-to-Token): Corruption Editing
-            # This is "self-correction" training. Instead of masking, we replace tokens
-            # with RANDOM tokens from the vocab. The model must recognize these are
-            # wrong and "edit" them back to the original clean token. This builds
-            # robustness against drafting errors during inference.
-            t_edit = NOISE_LOW + (NOISE_HIGH - NOISE_LOW) * torch.rand(1).item()
-            t2t_mask = torch.rand(n_pos) < t_edit
-            k = int(t2t_mask.sum().item())
-            if k > 0:
-                noise_tokens = vocab_ids[torch.randint(0, vocab_ids.numel(), (k,))]
-                x_t2t[i, resp_start:block_end][t2t_mask] = noise_tokens
-                labels_t2t[i, resp_start:block_end][t2t_mask] = x_clean[i, resp_start:block_end][t2t_mask]
-
-        attn_mask = attn_mask_proto[:, :, :L, :L].expand(B, -1, -1, -1).to(dtype=torch.float32)
-        # NOTE: forward() will convert this 0/1 4D into additive mask for SDPA path.
-
-        return x_m2t, labels_m2t, x_t2t, labels_t2t, attn_mask
-
-    dataset = load_dataset(dataset_name, split="train", streaming=True)
-    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate)
-
-    pbar = tqdm(total=max_steps)
-    for step, (x_m2t, labels_m2t, x_t2t, labels_t2t, attn_mask) in enumerate(loader):
-        if step >= max_steps:
-            break
-
-        x_m2t = x_m2t.to(device)
-        labels_m2t = labels_m2t.to(device)
-        x_t2t = x_t2t.to(device)
-        labels_t2t = labels_t2t.to(device)
-        attn_mask = attn_mask.to(device, dtype=model.dtype)
-
-        out_m2t = model(x_m2t, attention_mask=attn_mask, labels=labels_m2t)
-        loss_m2t = out_m2t.loss
-
-        out_t2t = model(x_t2t, attention_mask=attn_mask, labels=labels_t2t)
-        loss_t2t = out_t2t.loss
-
-        loss = omega_mask * loss_m2t + omega_edit * loss_t2t
-        loss.backward()
-        optimizer.step()
+    while step < cfg.num_steps:
         optimizer.zero_grad(set_to_none=True)
+        acc_m2t = acc_t2t = 0.0
+        acc_count = 0
 
-        pbar.set_description(f"loss={loss.item():.4f} m2t={loss_m2t.item():.4f} t2t={loss_t2t.item():.4f}")
+        for _ in range(cfg.grad_accum_steps):
+            ids, pmask = loader.next_train()
+            ids   = ids.to(device)
+            pmask = pmask.to(device)
+
+            num_blocks  = (cfg.seq_len + block_size - 1) // block_size
+            t_per_block = 0.05 + 0.90 * torch.rand(num_blocks, device=device)
+            attn        = attn_proto.expand(1, -1, -1, -1)
+            kpm         = pmask.bool()
+
+            # ── M2T ───────────────────────────────────────────────────────────
+            noisy_m2t, corrupted_m2t = corrupt_all_blocks(
+                ids, pmask, mask_id, block_size, t_per_block
+            )
+            out_m2t  = model(noisy_m2t, attention_mask=attn, key_padding_mask=kpm)
+            loss_m2t = (
+                F.cross_entropy(out_m2t.logits[0][corrupted_m2t[0]], ids[0][corrupted_m2t[0]])
+                if corrupted_m2t.any() else out_m2t.logits.sum() * 0.0
+            )
+
+            # ── T2T ───────────────────────────────────────────────────────────
+            noisy_t2t, corrupted_t2t = corrupt_all_blocks_t2t(
+                ids, pmask, vocab_ids, mask_id, block_size, t_per_block
+            )
+            out_t2t  = model(noisy_t2t, attention_mask=attn, key_padding_mask=kpm)
+            loss_t2t = (
+                F.cross_entropy(out_t2t.logits[0][corrupted_t2t[0]], ids[0][corrupted_t2t[0]])
+                if corrupted_t2t.any() else out_t2t.logits.sum() * 0.0
+            )
+
+            loss = (cfg.omega_m2t * loss_m2t + cfg.omega_t2t * loss_t2t) / cfg.grad_accum_steps
+            if torch.isfinite(loss):
+                loss.backward()
+                acc_m2t   += float(loss_m2t)
+                acc_t2t   += float(loss_t2t)
+                acc_count += 1
+
+        if acc_count > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0
+            )
+            optimizer.step()
+            scheduler.step()
+
+            avg_m2t = acc_m2t / acc_count
+            avg_t2t = acc_t2t / acc_count
+            m2t_ema = avg_m2t if m2t_ema is None else 0.95 * m2t_ema + 0.05 * avg_m2t
+            t2t_ema = avg_t2t if t2t_ema is None else 0.95 * t2t_ema + 0.05 * avg_t2t
+
+        step += 1
         pbar.update(1)
+        pbar.set_description(
+            f"m2t={m2t_ema:.3f}  t2t={t2t_ema:.3f}  "
+            f"lr={scheduler.get_last_lr()[0]:.2e}"
+        )
 
-        if step % 500 == 0 and step > 0:
-            model.save_pretrained(f"{output_dir}/step_{step}")
+        if step % cfg.eval_every == 0:
+            ppl = _eval_ppl(
+                model, loader, mask_id, block_size, attn_proto, device,
+                n_batches=cfg.test_eval_batches,
+            )
+            tqdm.write(f"--- Eval @ step {step} | ppl={ppl:.1f} ---")
+
+        if step % cfg.save_every == 0:
+            _save(model, optimizer, scheduler, step, cfg.output_dir)
 
     pbar.close()
-    model.save_pretrained(output_dir)
-    print("LoRA training complete.")
+    _save(model, optimizer, scheduler, step, cfg.output_dir)
+    print("Stage-2 LoRA training complete.")
 
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--teacher_model", type=str, default="inclusionAI/LLaDA2.1-mini", help="Path to teacher")
-    ap.add_argument("--use_gated_deltanet", action="store_true", help="Use Bidirectional Gated DeltaNet instead of classical linear attention")
-    ap.add_argument("--use_hybrid_local_softmax", action="store_true", help="Use Hybrid Local-Softmax and Global-GDN")
-    args = ap.parse_args()
-    
-    train_lora_step2(
-        model_checkpoint=args.teacher_model,
-        use_gated_deltanet=args.use_gated_deltanet,
-        use_hybrid_local_softmax=args.use_hybrid_local_softmax
-    )
+    ap.add_argument("--teacher_model_path",  default="inclusionAI/LLaDA2.1-mini")
+    ap.add_argument("--stage1_checkpoint",   default="",
+                    help="Dir containing linear_attn_delta.pt from stage-1 distillation")
+    ap.add_argument("--alpaca_dataset",      default="tatsu-lab/alpaca")
+    ap.add_argument("--output_dir",          default="./runs/lora_stage2")
+    ap.add_argument("--resume_from",         default="")
+    ap.add_argument("--device",              default="cuda:0")
+    ap.add_argument("--seq_len",             type=int,   default=1024)
+    ap.add_argument("--num_steps",           type=int,   default=10000)
+    ap.add_argument("--grad_accum_steps",    type=int,   default=8)
+    ap.add_argument("--lr",                  type=float, default=1e-4)
+    ap.add_argument("--min_lr",              type=float, default=1e-6)
+    ap.add_argument("--warmup_steps",        type=int,   default=200)
+    ap.add_argument("--lora_rank",           type=int,   default=16)
+    ap.add_argument("--omega_m2t",           type=float, default=0.5)
+    ap.add_argument("--omega_t2t",           type=float, default=0.5)
+    ap.add_argument("--eval_every",          type=int,   default=100)
+    ap.add_argument("--save_every",          type=int,   default=1000)
+    ap.add_argument("--test_size",           type=int,   default=256)
+    ap.add_argument("--test_eval_batches",   type=int,   default=16)
+    cfg = ap.parse_args()
+    train(cfg)

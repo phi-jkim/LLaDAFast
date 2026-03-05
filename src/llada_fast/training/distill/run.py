@@ -989,12 +989,26 @@ def distill_step1(cfg: DistillConfig) -> None:
                     f"ppl={ppl_display} ---"
                 )
                 gens = _generate_eval(student, tokenizer, cfg.eval_prompts, dev1, cfg)
+                os.makedirs(cfg.output_dir, exist_ok=True)
                 gen_path = os.path.join(cfg.output_dir, "generations.txt")
                 with open(gen_path, "a") as _gf:
                     _gf.write(f"\n=== Step {step} ===\n")
                     for prompt, gen in zip(cfg.eval_prompts, gens):
                         _gf.write(f"Prompt: {prompt}\nStudent: {gen}\n")
                 print(f"  Sample: {gens[0]}")
+
+                # ── Persist curves incrementally ──────────────────────────────────
+                import json
+                if ppl_history:
+                    ppl_path = os.path.join(cfg.output_dir, "ppl_curve.json")
+                    with open(ppl_path, "w") as _pf:
+                        json.dump({"ppl_curve": [{"step": s, "ppl": p} for s, p in ppl_history]}, _pf, indent=2)
+                
+                if loss_history:
+                    loss_path = os.path.join(cfg.output_dir, "loss_curve.json")
+                    keys = ["step", "train_loss", "train_m2t", "train_t2t", "test_loss", "test_m2t", "test_t2t"]
+                    with open(loss_path, "w") as _lf:
+                        json.dump({"loss_curve": [dict(zip(keys, row)) for row in loss_history]}, _lf, indent=2)
 
             if _triggered(cfg.save_every, step, inc):
                 _save_checkpoint(student, optimizer, curriculum, tokenizer, step, cfg)
@@ -1004,14 +1018,6 @@ def distill_step1(cfg: DistillConfig) -> None:
     teacher_hooks.remove()
     student_hooks.remove()
     _save_final(student, tokenizer, cfg)
-
-    # ── Persist perplexity curve ─────────────────────────────────────────────
-    if ppl_history:
-        import json
-        ppl_path = os.path.join(cfg.output_dir, "ppl_curve.json")
-        with open(ppl_path, "w") as _pf:
-            json.dump({"ppl_curve": [{"step": s, "ppl": p} for s, p in ppl_history]}, _pf, indent=2)
-        print(f"[DONE] Perplexity curve saved to {ppl_path} ({len(ppl_history)} points)")
 
 
 # ── CLI entrypoint ────────────────────────────────────────────────────────────
