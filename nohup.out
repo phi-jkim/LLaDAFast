@@ -1,0 +1,75 @@
+usage: train.py [-h] [--teacher_model_path TEACHER_MODEL_PATH]
+                [--stage1_checkpoint STAGE1_CHECKPOINT]
+                [--alpaca_dataset ALPACA_DATASET] [--output_dir OUTPUT_DIR]
+                [--resume_from RESUME_FROM] [--device DEVICE]
+                [--seq_len SEQ_LEN] [--num_steps NUM_STEPS]
+                [--grad_accum_steps GRAD_ACCUM_STEPS] [--lr LR]
+                [--min_lr MIN_LR] [--warmup_steps WARMUP_STEPS]
+                [--lora_rank LORA_RANK] [--omega_m2t OMEGA_M2T]
+                [--omega_t2t OMEGA_T2T] [--eval_every EVAL_EVERY]
+                [--save_every SAVE_EVERY] [--test_size TEST_SIZE]
+                [--test_eval_batches TEST_EVAL_BATCHES]
+                [--use_block_softmax_hybrid]
+train.py: error: unrecognized arguments:  
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:   0%|          | 0/8 [00:00<?, ?it/s]Loading checkpoint shards:  12%|█▎        | 1/8 [00:00<00:01,  5.69it/s]Loading checkpoint shards:  25%|██▌       | 2/8 [00:00<00:01,  5.87it/s]Loading checkpoint shards:  38%|███▊      | 3/8 [00:00<00:00,  5.93it/s]Loading checkpoint shards:  50%|█████     | 4/8 [00:00<00:00,  5.99it/s]Loading checkpoint shards:  62%|██████▎   | 5/8 [00:00<00:00,  6.04it/s]Loading checkpoint shards:  75%|███████▌  | 6/8 [00:00<00:00,  6.07it/s]Loading checkpoint shards:  88%|████████▊ | 7/8 [00:01<00:00,  6.05it/s]Loading checkpoint shards: 100%|██████████| 8/8 [00:01<00:00,  6.01it/s]Loading checkpoint shards: 100%|██████████| 8/8 [00:01<00:00,  5.99it/s]
+Some weights of LLaDA2MoeModelLM were not initialized from the model checkpoint at inclusionAI/LLaDA2.1-mini and are newly initialized: ['model.layers.0.attention.linear_attention.alpha', 'model.layers.0.attention.linear_attention.hedgehog_weights', 'model.layers.1.attention.linear_attention.alpha', 'model.layers.1.attention.linear_attention.hedgehog_weights', 'model.layers.10.attention.linear_attention.alpha', 'model.layers.10.attention.linear_attention.hedgehog_weights', 'model.layers.11.attention.linear_attention.alpha', 'model.layers.11.attention.linear_attention.hedgehog_weights', 'model.layers.12.attention.linear_attention.alpha', 'model.layers.12.attention.linear_attention.hedgehog_weights', 'model.layers.13.attention.linear_attention.alpha', 'model.layers.13.attention.linear_attention.hedgehog_weights', 'model.layers.14.attention.linear_attention.alpha', 'model.layers.14.attention.linear_attention.hedgehog_weights', 'model.layers.15.attention.linear_attention.alpha', 'model.layers.15.attention.linear_attention.hedgehog_weights', 'model.layers.16.attention.linear_attention.alpha', 'model.layers.16.attention.linear_attention.hedgehog_weights', 'model.layers.17.attention.linear_attention.alpha', 'model.layers.17.attention.linear_attention.hedgehog_weights', 'model.layers.18.attention.linear_attention.alpha', 'model.layers.18.attention.linear_attention.hedgehog_weights', 'model.layers.19.attention.linear_attention.alpha', 'model.layers.19.attention.linear_attention.hedgehog_weights', 'model.layers.2.attention.linear_attention.alpha', 'model.layers.2.attention.linear_attention.hedgehog_weights', 'model.layers.3.attention.linear_attention.alpha', 'model.layers.3.attention.linear_attention.hedgehog_weights', 'model.layers.4.attention.linear_attention.alpha', 'model.layers.4.attention.linear_attention.hedgehog_weights', 'model.layers.5.attention.linear_attention.alpha', 'model.layers.5.attention.linear_attention.hedgehog_weights', 'model.layers.6.attention.linear_attention.alpha', 'model.layers.6.attention.linear_attention.hedgehog_weights', 'model.layers.7.attention.linear_attention.alpha', 'model.layers.7.attention.linear_attention.hedgehog_weights', 'model.layers.8.attention.linear_attention.alpha', 'model.layers.8.attention.linear_attention.hedgehog_weights', 'model.layers.9.attention.linear_attention.alpha', 'model.layers.9.attention.linear_attention.hedgehog_weights']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+[INIT] Sharded model across 2 GPUs
+trainable params: 301,658,112 || all params: 16,559,918,400 || trainable%: 1.8216
+[Alpaca] 52002 examples  test=256  train=51746
+  0%|          | 0/10000 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/orcd/home/002/jinhakim/LLaDAFast/src/llada_fast/training/lora/train.py", line 456, in <module>
+    train(cfg)
+  File "/orcd/home/002/jinhakim/LLaDAFast/src/llada_fast/training/lora/train.py", line 377, in train
+    out_t2t  = model(noisy_t2t, attention_mask=attn, key_padding_mask=kpm)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/peft/peft_model.py", line 921, in forward
+    return self.get_base_model()(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/orcd/home/002/jinhakim/LLaDAFast/src/llada_fast/modeling/modeling_llada2_moe.py", line 790, in forward
+    outputs = self.model(
+              ^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/orcd/home/002/jinhakim/LLaDAFast/src/llada_fast/modeling/modeling_llada2_moe.py", line 695, in forward
+    layer_outputs = decoder_layer(
+                    ^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/orcd/home/002/jinhakim/LLaDAFast/src/llada_fast/modeling/modeling_llada2_moe.py", line 507, in forward
+    hidden_states = self.mlp(hidden_states)
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jinhakim/.conda/envs/llada_fast/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/orcd/home/002/jinhakim/LLaDAFast/src/llada_fast/modeling/modeling_llada2_moe.py", line 203, in forward
+    y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 64.00 MiB. GPU 0 has a total capacity of 44.39 GiB of which 39.31 MiB is free. Including non-PyTorch memory, this process has 44.35 GiB memory in use. Of the allocated memory 43.82 GiB is allocated by PyTorch, and 29.19 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+  0%|          | 0/10000 [00:02<?, ?it/s]

@@ -25,6 +25,7 @@ Key paradigms
 
 import argparse
 import glob
+import json
 import math
 import os
 import random
@@ -210,19 +211,32 @@ def _build_scheduler(
     cfg: DistillConfig, optimizer: torch.optim.Optimizer, last_epoch: int = 0
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """
-    Linear warmup then cosine decay from learning_rate → min_lr over num_steps.
-    Pass last_epoch=step when resuming to fast-forward to the correct LR position.
+    Linear warmup then cosine decay from learning_rate → min_lr.
+
+    All units are GRADIENT UPDATES (one per optimizer.step() call).
+    num_steps and warmup_steps from cfg are in sequences, so we divide by
+    sequences_per_update = batch_size * grad_accum_steps to get gradient-update
+    counts.  scheduler.step() is called once per optimizer.step(), so
+    current_step in the lambda correctly tracks gradient updates.
+
+    Pass last_epoch=step (sequences) when resuming; the conversion is applied here.
     """
+    seq_per_update  = max(1, cfg.batch_size * cfg.grad_accum_steps)
+    total_updates   = max(1, cfg.num_steps    // seq_per_update)
+    warmup_updates  = max(1, cfg.warmup_steps // seq_per_update)
+    done_updates    = last_epoch // seq_per_update   # gradient updates already done
+
+    eta_min_ratio = cfg.min_lr / cfg.learning_rate
+
     def _lr_lambda(current_step: int) -> float:
-        if current_step < cfg.warmup_steps:
-            return float(current_step) / max(1, cfg.warmup_steps)
-        progress = float(current_step - cfg.warmup_steps) / max(1, cfg.num_steps - cfg.warmup_steps)
+        if current_step < warmup_updates:
+            return float(current_step) / warmup_updates
+        progress = float(current_step - warmup_updates) / max(1, total_updates - warmup_updates)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        eta_min_ratio = cfg.min_lr / cfg.learning_rate
         return eta_min_ratio + (1.0 - eta_min_ratio) * cosine
 
-    # last_epoch - 1: LambdaLR.__init__ calls step() once internally, advancing to last_epoch.
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch - 1)
+    # last_epoch - 1: LambdaLR.__init__ calls step() once, advancing to done_updates.
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda, last_epoch=done_updates - 1)
 
 
 # ── Checkpoint save / resume ──────────────────────────────────────────────────
@@ -475,10 +489,6 @@ def distill_step1(cfg: DistillConfig) -> None:
     teacher.lm_head.float()
     student.lm_head.float()
 
-    # Fixed sequences for perplexity tracking (3 sequences, always the same).
-    _n_ppl = min(3, test_buffer._n)
-    _ppl_seqs = [(test_buffer._ids[i], test_buffer._masks[i]) for i in range(_n_ppl)]
-
     # ── Test-loss evaluation helper ───────────────────────────────────────────
     @torch.no_grad()
     def _eval_test_loss() -> tuple:
@@ -489,10 +499,12 @@ def distill_step1(cfg: DistillConfig) -> None:
         student.eval()
         tot_loss = tot_m2t = tot_t2t = 0.0
         n_ok = 0
-        for _ in range(cfg.test_eval_batches):
-            ids, pmask = test_buffer.next_batch(cfg.batch_size)
-            ids   = ids.to(dev0)
-            pmask = pmask.to(dev0)
+        n_batches = (test_buffer._n + cfg.batch_size - 1) // cfg.batch_size
+        for b in range(n_batches):
+            s_idx = b * cfg.batch_size
+            e_idx = min(s_idx + cfg.batch_size, test_buffer._n)
+            ids = torch.cat(test_buffer._ids[s_idx:e_idx], dim=0).to(dev0)
+            pmask = torch.cat(test_buffer._masks[s_idx:e_idx], dim=0).to(dev0)
             B_t   = ids.shape[0]
 
             full_nb   = (cfg.seq_len + block_size - 1) // block_size
@@ -645,9 +657,9 @@ def distill_step1(cfg: DistillConfig) -> None:
         student.eval()
         attn_1L = build_block_causal_mask(cfg.seq_len, block_size, dev1, student.dtype)  # (1,1,L,L)
         ces = []
-        for ids_t, mask_t in _ppl_seqs:
-            ids_t  = ids_t.to(dev1)   # (1, L)
-            mask_t = mask_t.to(dev1)  # (1, L)
+        for i in range(test_buffer._n):
+            ids_t  = test_buffer._ids[i].to(dev1)   # (1, L)
+            mask_t = test_buffer._masks[i].to(dev1)  # (1, L)
             real   = mask_t.bool()
 
             valid_len = real[0].sum().item()
@@ -998,7 +1010,6 @@ def distill_step1(cfg: DistillConfig) -> None:
                 print(f"  Sample: {gens[0]}")
 
                 # ── Persist curves incrementally ──────────────────────────────────
-                import json
                 if ppl_history:
                     ppl_path = os.path.join(cfg.output_dir, "ppl_curve.json")
                     with open(ppl_path, "w") as _pf:
